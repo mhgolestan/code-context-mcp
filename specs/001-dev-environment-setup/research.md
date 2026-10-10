@@ -3,7 +3,7 @@
 ## Database image
 
 - **Decision**: Oracle's official `container-registry.oracle.com/database/free:latest` (Oracle AI Database 26ai Free), run through Compose with a named volume on `/opt/oracle/oradata`.
-- **Rationale**: the constitution names 26ai as the reference database. The official image includes AI Vector Search, honors `ORACLE_PWD`, runs scripts mounted at `/opt/oracle/scripts/setup` on first start, and ships `/opt/oracle/checkDBStatus.sh` for a healthcheck.
+- **Rationale**: the constitution names 26ai as the reference database. The official image includes AI Vector Search, honors `ORACLE_PWD`, ships a prebuilt database (so `/opt/oracle/scripts/setup` never runs) and runs scripts mounted at `/opt/oracle/scripts/startup` on every start, and ships `/opt/oracle/checkDBStatus.sh` for a healthcheck.
 - **Alternatives considered**: `gvenzl/oracle-free` is faster to start and creates an app user from env vars, but it is community-maintained and its tags may trail the 26ai release. Autonomous Database Free (`adb-free`) needs `SYS_ADMIN` and FUSE and adds wallets: too heavy for a laptop.
 
 ## Application user

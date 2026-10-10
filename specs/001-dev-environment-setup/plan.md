@@ -51,7 +51,7 @@ specs/001-dev-environment-setup/
 
 ```text
 compose.yaml                     # Oracle 26ai Free, named volume, healthcheck, port from .env
-db/setup/01_app_user.sh          # first-run: create app user in FREEPDB1 from env
+db/startup/01_app_user.sh        # every start: ensure app user in FREEPDB1 from env
 .env.example                     # every setting, placeholder secrets
 .gitignore                       # .env, .venv, __pycache__, caches
 .python-version                  # 3.11

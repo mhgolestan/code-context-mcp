@@ -16,7 +16,7 @@ Loaded once by `config.py` from the process environment, with `.env` at the proj
 | oracle_pwd | `ORACLE_PWD` | string | container only | none | **yes** |
 | repos_dir | `CCCTX_REPOS_DIR` | path | no | `../ccctx-repos` (resolved against project root) | no |
 
-`ORACLE_PWD` is read by the container and the first-run script `db/setup/01_app_user.sh`, never by the Python package. `DB_PORT` is also the host port Compose publishes, so a port clash is fixed in one place.
+`ORACLE_PWD` is read by the container and the startup script `db/startup/01_app_user.sh`, never by the Python package. `DB_PORT` is also the host port Compose publishes, so a port clash is fixed in one place.
 
 **Validation rules**
 

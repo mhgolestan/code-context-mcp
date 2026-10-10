@@ -11,7 +11,7 @@ from pathlib import Path
 
 import pytest
 
-from golestan_code_mcp import db, ingest, registry, schema
+from golestan_code_mcp import db, ingest, registry, schema, semantic
 from golestan_code_mcp.config import load
 
 ENV = {"CCCTX_MAX_FILE_BYTES": "2048"}
@@ -117,6 +117,11 @@ def conn():
     except Exception as e:  # config missing or database down: skip, never fail
         pytest.skip(f"database unreachable: {type(e).__name__}")
     schema.migrate(conn)
+    try:
+        semantic.require_model(conn)
+    except semantic.ModelError:
+        conn.close()
+        pytest.skip("embedding model not loaded: run `ccctx model load`")
     yield conn
     with conn.cursor() as cur:
         cur.execute("delete from ccctx_repos where name like 't-%'")
@@ -195,6 +200,47 @@ def test_failed_ingest_keeps_previous_index(conn, repo, monkeypatch):
     with pytest.raises(RuntimeError):
         ingest.ingest(conn, name, ENV)
     assert stored(conn, name) == before
+
+
+def test_every_symbol_gets_an_embedding(conn, repo):
+    name = register(conn, repo)
+    summary = ingest.ingest(conn, name, ENV)
+    with conn.cursor() as cur:
+        cur.execute(
+            """select count(*), count(case when s.embedding is not null then 1 end), min(vector_dimension_count(s.embedding))
+                 from ccctx_symbols s join ccctx_files f on f.id = s.file_id join ccctx_repos r on r.id = f.repo_id
+                where r.name = :n""",
+            n=name,
+        )
+        assert cur.fetchone() == (summary.symbols, summary.symbols, 384)  # SC-002
+        cur.execute(
+            """select s.name from ccctx_symbols s join ccctx_files f on f.id = s.file_id
+                 join ccctx_repos r on r.id = f.repo_id
+                where r.name = :n
+                order by vector_distance(s.embedding,
+                         vector_embedding(ALL_MINILM_L12_V2 using 'method that runs the service' as data), cosine)
+                fetch first 1 rows only""",
+            n=name,
+        )
+        assert cur.fetchone()[0] in ("Service.run", "Service")  # embedded text carries name, kind and path
+
+
+def test_missing_model_changes_nothing(conn, repo, monkeypatch):
+    name = register(conn, repo)
+    ingest.ingest(conn, name, ENV)
+    before = stored(conn, name)
+
+    def missing(conn):
+        raise semantic.ModelError("embedding model ALL_MINILM_L12_V2 is not set up; run `ccctx model load`")
+
+    def no_discovery(*args):
+        raise AssertionError("discover ran before the model check")
+
+    monkeypatch.setattr(semantic, "require_model", missing)
+    monkeypatch.setattr(ingest, "discover", no_discovery)
+    with pytest.raises(semantic.ModelError, match="ccctx model load"):
+        ingest.ingest(conn, name, ENV)
+    assert stored(conn, name) == before  # FR-008
 
 
 def test_dirty_tree_flagged(conn, repo):

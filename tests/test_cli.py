@@ -7,7 +7,7 @@ from collections import Counter
 
 import pytest
 
-from golestan_code_mcp import cli, db, ingest, registry
+from golestan_code_mcp import cli, db, ingest, registry, semantic
 from golestan_code_mcp.config import load
 
 FAKE_PW = "Not-A-Real-Pw-42"
@@ -149,7 +149,16 @@ def make_repo(root):
 
 
 @pytest.fixture
-def ingested(live, capsys, tmp_path):
+def model(live):
+    with db.connect(load()) as conn:
+        try:
+            semantic.require_model(conn)
+        except (semantic.ModelError, Exception) as e:
+            pytest.skip(f"embedding model not loaded: {type(e).__name__}")
+
+
+@pytest.fixture
+def ingested(model, capsys, tmp_path):
     n = f"t-{uuid.uuid4().hex[:8]}"
     run(capsys, "repo", "add", str(make_repo(tmp_path / "r")), "--name", n)
     code, out, err = run(capsys, "ingest", n)
@@ -165,7 +174,7 @@ def test_ingest_prints_summary(ingested):
     assert "(1 no grammar, 1 parse errors)" in lines[3]
 
 
-def test_ingest_refusals_exit_1(live, capsys, tmp_path):
+def test_ingest_refusals_exit_1(model, capsys, tmp_path):
     assert run(capsys, "ingest", "t-missing")[0] == 1
     n = f"t-{uuid.uuid4().hex[:8]}"
     run(capsys, "repo", "add", str(tmp_path), "--name", n)
@@ -190,3 +199,55 @@ def test_stats_by_language(ingested, capsys):
     header, *rows = out.splitlines()
     assert code == 0 and header.split() == ["REPO", "LANGUAGE", "FILES", "SYMBOLS", "CHUNKS"]
     assert [r.split() for r in rows] == [[n, "markdown", "1", "0", "1"], [n, "python", "2", "3", "1"]]
+
+
+# --- model load and search (004) ----------------------------------------------------------------------------
+
+
+def test_model_load_when_present(model, capsys):
+    code, out, _ = run(capsys, "model", "load")
+    assert code == 0 and out.strip() == "model ALL_MINILM_L12_V2 already present (384 dimensions)"
+
+
+def test_search_prints_ranked_table(ingested, capsys):
+    n, _ = ingested
+    code, out, _ = run(capsys, "search", "a method on class B", "--repo", n)
+    header, *rows = out.splitlines()
+    assert code == 0 and header.split() == ["RANK", "SIMILARITY", "REPO", "KIND", "NAME", "PATH", "LINES"]
+    assert rows and rows[0].split()[0] == "1"
+    sims = [float(r.split()[1]) for r in rows]
+    assert sims == sorted(sims, reverse=True) and all(s >= 0.3 for s in sims)
+    assert all(len(r.split()[1].split(".")[1]) == 3 for r in rows)  # three decimals
+
+
+def test_search_nothing_similar_enough(ingested, capsys, monkeypatch):
+    n, _ = ingested
+    monkeypatch.setattr(semantic, "search", lambda conn, question, repo=None: [])
+    code, out, _ = run(capsys, "search", "recipe for sourdough bread", "--repo", n)
+    assert code == 0 and out.strip() == "no symbols similar enough (similarity >= 0.30)"
+
+
+@pytest.mark.parametrize("question", ["", "   "])
+def test_search_empty_question_refused_before_connecting(capsys, monkeypatch, question):
+    monkeypatch.setenv("DB_PORT", "1")
+    code, out, err = run(capsys, "search", question)
+    assert code == 1 and out == "" and "question" in err
+
+
+def test_search_unknown_repo(model, capsys):
+    code, _, err = run(capsys, "search", "routing", "--repo", "t-missing")
+    assert code == 1 and "no repository named 't-missing'" in err
+
+
+def test_search_missing_model_hint(live, capsys, monkeypatch):
+    monkeypatch.setattr(semantic, "MODEL", "NOT_A_MODEL")
+    code, _, err = run(capsys, "search", "routing")
+    assert code == 1 and "ccctx model load" in err
+
+
+def test_search_unreachable_exits_2(capsys, monkeypatch):
+    monkeypatch.setenv("DB_PORT", "1")
+    monkeypatch.setenv("DB_PASSWORD", FAKE_PW)
+    started = time.monotonic()
+    code, out, err = run(capsys, "search", "routing")
+    assert time.monotonic() - started < 5 and code == 2 and FAKE_PW not in out + err

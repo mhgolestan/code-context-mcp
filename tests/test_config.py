@@ -1,6 +1,23 @@
 import pytest
 
-from golestan_code_mcp.config import PROJECT_ROOT, ConfigError, load, max_file_bytes, repos_dir, vendor_dirs
+from golestan_code_mcp.config import (
+    MODEL_URL,
+    PROJECT_ROOT,
+    ConfigError,
+    load,
+    max_file_bytes,
+    model_cache,
+    model_url,
+    repos_dir,
+    vendor_dirs,
+)
+
+
+def test_model_settings_defaults_and_overrides(tmp_path):
+    assert model_url({}) == MODEL_URL and MODEL_URL.endswith("/all_MiniLM_L12_v2.onnx")
+    assert model_url({"CCCTX_MODEL_URL": " https://example.test/m.onnx "}) == "https://example.test/m.onnx"
+    assert model_cache({}) == (PROJECT_ROOT / ".cache/models").resolve()
+    assert model_cache({"CCCTX_MODEL_CACHE": str(tmp_path)}) == tmp_path.resolve()
 
 SECRET = "s3cr3t-Pa55"
 BASE = {"DB_USER": "ccctx", "DB_PASSWORD": SECRET}

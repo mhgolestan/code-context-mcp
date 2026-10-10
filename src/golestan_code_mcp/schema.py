@@ -54,6 +54,16 @@ MIGRATIONS: list[tuple[int, str, list[str]]] = [
         """alter table ccctx_symbols add constraint ccctx_symbols_commit_ck
           check (regexp_like(commit_sha, '^[0-9a-f]{40}([0-9a-f]{24})?$'))""",
     ]),
+    # Nullable: symbols indexed before this step keep working until they are re-ingested.
+    # The HNSW index is built by `ccctx model load`, because it needs the vector memory pool.
+    (3, "symbol embedding", [
+        "alter table ccctx_symbols add (embedding vector(384, float32))",
+        """create table ccctx_embedding_model (
+          model_name  varchar2(128) primary key,
+          dimension   number not null,
+          loaded_at   timestamp with time zone default systimestamp not null
+        )""",
+    ]),
 ]
 
 

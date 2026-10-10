@@ -38,6 +38,22 @@ def repos_dir(env: Mapping[str, str]) -> Path:
     return (path if path.is_absolute() else PROJECT_ROOT / path).resolve()
 
 
+MODEL_URL = (
+    "https://adwc4pm.objectstorage.us-ashburn-1.oci.customer-oci.com/p/"
+    "iPX9W0MZeRkwJKWdFmdJCemmN-iKAl_bFvNGYLW7YqIrw4kKsukL24J2q93Beb9S/n/adwc4pm/b/OML-ai-models/o/"
+    "all_MiniLM_L12_v2.onnx"
+)
+
+
+def model_url(env: Mapping[str, str]) -> str:
+    return (env.get("CCCTX_MODEL_URL") or "").strip() or MODEL_URL
+
+
+def model_cache(env: Mapping[str, str]) -> Path:
+    path = Path((env.get("CCCTX_MODEL_CACHE") or "").strip() or ".cache/models")
+    return (path if path.is_absolute() else PROJECT_ROOT / path).resolve()
+
+
 def max_file_bytes(env: Mapping[str, str]) -> int:
     text = (env.get("CCCTX_MAX_FILE_BYTES") or "").strip() or "1048576"
     if not text.isdigit() or int(text) < 1:

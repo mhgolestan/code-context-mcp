@@ -6,8 +6,8 @@ import sys
 
 import oracledb
 
-from golestan_code_mcp import db, ingest, registry, schema
-from golestan_code_mcp.config import ConfigError, load
+from golestan_code_mcp import db, ingest, registry, schema, semantic
+from golestan_code_mcp.config import environment, load
 
 SKIP_ORDER = ["ignored", "vendored", "binary", "too large"]
 KINDS = ["function", "method", "class", "type", "interface", "chunk"]
@@ -40,14 +40,6 @@ def format_summary(s: ingest.Summary) -> str:
     return "\n".join(lines)
 
 
-def _repo_id(conn, name: str) -> int:
-    with conn.cursor() as cur:
-        row = cur.execute("select id from ccctx_repos where name = :n", n=name).fetchone()
-    if row is None:
-        raise registry.RegistryError(f"no repository named '{name}'")
-    return row[0]
-
-
 def _repo_add(conn, args) -> str:
     repo = registry.add_repo(conn, args.path, args.name)
     return f"registered {repo.name} {repo.path}"
@@ -69,7 +61,7 @@ def _ingest(conn, args) -> str:
 
 
 def _symbols(conn, args) -> str:
-    repo_id = _repo_id(conn, args.repo)
+    repo_id = registry.repo_id(conn, args.repo)
     with conn.cursor() as cur:
         cur.execute(
             """select s.name, s.kind, f.language, f.path, s.start_line || '-' || s.end_line
@@ -84,7 +76,7 @@ def _symbols(conn, args) -> str:
 
 
 def _stats(conn, args) -> str:
-    repo_id = _repo_id(conn, args.repo) if args.repo else None
+    repo_id = registry.repo_id(conn, args.repo) if args.repo else None
     with conn.cursor() as cur:
         cur.execute(
             """select r.name, f.language, count(distinct f.id),
@@ -100,6 +92,19 @@ def _stats(conn, args) -> str:
     if not rows:
         return "nothing indexed"
     return format_table(("REPO", "LANGUAGE", "FILES", "SYMBOLS", "CHUNKS"), rows, frozenset({2, 3, 4}))
+
+
+def _model_load(conn, args) -> str:
+    return semantic.load_model(conn, environment())
+
+
+def _search(conn, args) -> str:
+    results = semantic.search(conn, args.question, args.repo)
+    if not results:
+        return f"no symbols similar enough (similarity >= {semantic.FLOOR:.2f})"
+    rows = [(r.rank, f"{r.similarity:.3f}", r.repo, r.kind, r.name, r.path, f"{r.start_line}-{r.end_line}")
+            for r in results]
+    return format_table(("RANK", "SIMILARITY", "REPO", "KIND", "NAME", "PATH", "LINES"), rows, frozenset({0, 1}))
 
 
 def _db_migrate(conn, args) -> str:
@@ -142,6 +147,14 @@ def parser() -> argparse.ArgumentParser:
     st.add_argument("--repo")
     st.set_defaults(run=_stats)
 
+    srch = groups.add_parser("search", help="find symbols by meaning")
+    srch.add_argument("question")
+    srch.add_argument("--repo")
+    srch.set_defaults(run=_search)
+
+    model = groups.add_parser("model", help="embedding model").add_subparsers(dest="cmd", required=True)
+    model.add_parser("load", help="download once and load the embedding model").set_defaults(run=_model_load)
+
     dbp = groups.add_parser("db", help="database administration").add_subparsers(dest="cmd", required=True)
     dbp.add_parser("migrate", help="apply missing schema migrations").set_defaults(run=_db_migrate)
     return p
@@ -152,20 +165,27 @@ def main(argv: list[str] | None = None) -> int:
     handler = logging.StreamHandler(sys.stderr)  # the structured ingest record goes to stderr
     ingest.log.addHandler(handler)
     ingest.log.setLevel(logging.INFO)
+    conn = None
     try:
         if args.run is _repo_add:  # refuse bad input before touching the database
             registry.validate_name(args.name)
             registry.resolve_dir(args.path)
-        with db.connect(load()) as conn:
+        if args.run is _search and not args.question.strip():
+            raise ValueError("the question is empty")
+        conn = db.connect(load())
+        with conn:
             if args.run is not _db_migrate:
                 schema.migrate(conn)
             print(args.run(conn, args))
-    except (ConfigError, registry.RegistryError, ingest.IngestError) as e:
+    except (ValueError, ingest.IngestError) as e:  # ConfigError, RegistryError and ModelError are ValueErrors
         print(f"error: {e}", file=sys.stderr)
         return 1
     except oracledb.Error as e:
         code = getattr(e.args[0], "full_code", "")
-        reason = "database is still starting" if code in db.STARTING_CODES else f"database unreachable: {db.describe(e)}"
+        if code in db.STARTING_CODES:
+            reason = "database is still starting"
+        else:  # a failure after connecting is not an outage
+            reason = f"database {'error' if conn else 'unreachable'}: {db.describe(e)}"
         print(f"error: {reason}", file=sys.stderr)
         return 2
     finally:

@@ -64,6 +64,15 @@ def add_repo(conn, path: str | Path, name: str) -> Repo:
     return Repo(name, resolved, 0, 0)
 
 
+def repo_id(conn, name: str) -> int:
+    """The id of a registered repository, whether or not its directory still exists."""
+    with conn.cursor() as cur:
+        row = cur.execute("select id from ccctx_repos where name = :n", n=name).fetchone()
+    if row is None:
+        raise RegistryError(f"no repository named '{name}'")
+    return row[0]
+
+
 def get_repo(conn, name: str) -> tuple[int, Path]:
     """The id and directory of a registered repository. The directory must still exist."""
     validate_name(name)

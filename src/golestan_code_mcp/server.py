@@ -6,7 +6,7 @@ import oracledb
 from mcp.server.fastmcp import FastMCP
 from pydantic import BaseModel
 
-from golestan_code_mcp import __version__, db, registry, schema
+from golestan_code_mcp import __version__, db, registry, schema, semantic
 from golestan_code_mcp.config import ConfigError, load
 
 NAME = "golestan_code_mcp"
@@ -55,6 +55,41 @@ def list_repositories() -> RepoList:
     except oracledb.Error as e:
         return RepoList(database="unreachable", reason=db.describe(e), repositories=[])
     return RepoList(database="reachable", reason=None, repositories=[RepoInfo(**vars(r)) for r in repos])
+
+
+class SearchHit(BaseModel):
+    rank: int
+    similarity: float
+    repo: str
+    kind: str
+    name: str
+    path: str
+    start_line: int
+    end_line: int
+
+
+class SearchResults(BaseModel):
+    status: Literal["ok", "unavailable"]
+    reason: str | None
+    results: list[SearchHit]
+
+
+@mcp.tool(
+    description="Find indexed code by meaning: the 10 symbols closest to a plain-English question, "
+    "each with its similarity (0.3 or more), repository, path and line range. Optionally limit to one repository."
+)
+def search(question: str, repo: str | None = None) -> SearchResults:
+    try:
+        if not question.strip():
+            raise ValueError("the question is empty")
+        with db.connect(load()) as conn:
+            schema.migrate(conn)
+            hits = semantic.search(conn, question, repo)
+    except ValueError as e:  # ConfigError, RegistryError and ModelError are ValueErrors
+        return SearchResults(status="unavailable", reason=str(e), results=[])
+    except oracledb.Error as e:
+        return SearchResults(status="unavailable", reason=db.describe(e), results=[])
+    return SearchResults(status="ok", reason=None, results=[SearchHit(**vars(h)) for h in hits])
 
 
 def main() -> None:

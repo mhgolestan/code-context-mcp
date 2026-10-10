@@ -82,7 +82,7 @@ Exit codes: `0` ok, `1` refused input or a missing setting, `2` the database is 
 
 ## Ingesting a codebase
 
-`ccctx ingest <name>` indexes a registered git repository as it is on disk and replaces whatever was indexed before. Each run prints a summary:
+`ccctx ingest <name>` indexes a registered git repository as it is on disk and replaces whatever was indexed before. It needs the embedding model (see [Searching by meaning](#searching-by-meaning)) and refuses to run without it. Each run prints a summary:
 
 ```sh
 uv run ccctx ingest flask
@@ -91,9 +91,11 @@ uv run ccctx ingest flask
 ```text
 Scanned   236 files
 Skipped     5 files (5 binary)
-Indexed 1,353 symbols in 1.5s
+Indexed 1,353 symbols in 125.4s
 Fallback  148 files as line windows (148 no grammar, 0 parse errors)
 ```
+
+Most of that time is the database embedding every symbol.
 
 How files are chosen:
 
@@ -113,6 +115,39 @@ uv run ccctx symbols --repo flask --limit 5      # parsed symbols first; --kind 
 uv run ccctx stats --by-language                 # files, symbols and fallback chunks per repo and language
 ```
 
+## Searching by meaning
+
+The database embeds code itself with Oracle's prebuilt ONNX `all_MiniLM_L12_v2` model, loaded as `ALL_MINILM_L12_V2`. There is no API key and no network call at search time, and source code never leaves the database to be embedded.
+
+**1. Load the model once.** This downloads the 133 MB model file into `.cache/models/` (git-ignored), loads it with `DBMS_VECTOR.LOAD_ONNX_MODEL`, records its name and dimension, and builds the HNSW vector index. Running it again does nothing.
+
+```sh
+uv run ccctx model load
+```
+
+Check it from SQL:
+
+```sql
+SELECT model_name FROM user_mining_models;                                   -- ALL_MINILM_L12_V2
+SELECT VECTOR_EMBEDDING(ALL_MINILM_L12_V2 USING 'hello world' as data) AS v;  -- 384 numbers
+```
+
+`CCCTX_MODEL_URL` and `CCCTX_MODEL_CACHE` change where the file comes from and where it is kept.
+
+The index lives in the database's vector memory pool. The first container start after this step sets the pool to 256 MB and restarts the database once (`db/startup/02_vector_memory.sh`). Later starts leave it alone.
+
+**2. Re-ingest** each repository, so every symbol gets an embedding. Each symbol's kind, name, path and source are embedded together.
+
+**3. Ask a question.**
+
+```sh
+uv run ccctx search "how are incoming requests routed to handlers"
+uv run ccctx search "recipe for sourdough bread"      # no symbols similar enough (similarity >= 0.30)
+uv run ccctx search "error handling" --repo gin
+```
+
+Search returns the 10 symbols closest by cosine distance, through the approximate HNSW index, and drops any below a similarity of 0.3. A weak match is worse than none when the results feed a language model. Each row shows its rank, similarity, repository, kind, name, path and lines.
+
 ## Checking that data persists
 
 `uv run pytest` adds a row to the `ccctx_smoke` table on each run. Note the count, restart the container, and check it again:
@@ -128,10 +163,11 @@ The second count matches the first. `docker compose down` also keeps the data. O
 
 ## The MCP server
 
-The server talks MCP over standard input and output. It has two tools:
+The server talks MCP over standard input and output. It has three tools:
 
 - `health` returns the server name, version and whether the database is reachable.
 - `list_repositories` returns the registered repositories with their paths and file and symbol counts, the same as `ccctx repo list`.
+- `search` takes a `question` and an optional `repo`, and returns the same results as `ccctx search`, with `status` `ok` or `unavailable`.
 
 A stopped database gives `"database": "unreachable"` with a reason, not an error.
 
@@ -172,11 +208,13 @@ Then run `/mcp` in Claude Code and ask it to call the `health` tool.
 ```text
 compose.yaml              Oracle AI Database 26ai Free, named volume oradata
 db/startup/01_app_user.sh every start: ensures DB_USER exists in FREEPDB1
+db/startup/02_vector_memory.sh first start: enables the vector memory pool, restarts once
 src/golestan_code_mcp/    config, db check, sample cloner, MCP server
   schema.py               ordered, re-runnable migrations
   registry.py             register and list repositories (shared by CLI and MCP)
   chunker.py              tree-sitter chunks for Python, Go, JavaScript; line-window fallback
   ingest.py               list files with read-only git, skip rules, store one repository's index
+  semantic.py             embedding model setup, model check, semantic search
   cli.py                  the ccctx command
 tests/                    pytest suite and chunker fixtures
 ```

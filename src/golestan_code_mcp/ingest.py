@@ -17,11 +17,12 @@ from pathlib import Path, PurePosixPath
 
 import oracledb
 
-from golestan_code_mcp import chunker
+from golestan_code_mcp import chunker, semantic
 from golestan_code_mcp.config import environment, max_file_bytes, vendor_dirs
 from golestan_code_mcp.registry import get_repo
 
 log = logging.getLogger("golestan_code_mcp.ingest")
+EMBED_CHARS = 4000  # more than the model reads; keeps the bind a VARCHAR2
 
 GIT_SAFE = ["-c", "core.fsmonitor=false", "-c", f"core.hooksPath={os.devnull}", "--no-optional-locks"]
 
@@ -89,14 +90,19 @@ def _sha(text: str) -> str:
     return hashlib.sha256(text.encode("utf-8")).hexdigest()
 
 
-def _insert_symbols(cur, rows: list[tuple]) -> None:
+def _insert_symbols(cur, rows: list[dict]) -> None:
+    """The database embeds each symbol as it is inserted: kind, name and path first, so truncation keeps them."""
     if not rows:
         return
-    cur.setinputsizes(None, None, None, None, None, oracledb.DB_TYPE_CLOB, None, None)
+    cur.setinputsizes(source=oracledb.DB_TYPE_CLOB)
+    # :source (a LOB) must be the last bind, or long sources fail with ORA-24816. The model reads only its
+    # first few hundred tokens, so the text it embeds is capped at EMBED_CHARS and bound as a plain string.
     cur.executemany(
-        "insert into ccctx_symbols (file_id, name, kind, start_line, end_line, source, content_hash, commit_sha)"
-        " values (:1, :2, :3, :4, :5, :6, :7, :8)",
-        rows,
+        "insert into ccctx_symbols (file_id, name, kind, start_line, end_line, content_hash, commit_sha, embedding,"
+        " source) values (:file_id, :name, :kind, :start_line, :end_line, :content_hash, :commit_sha,"
+        f" vector_embedding({semantic.MODEL} using :text as data), :source)",
+        [{k: v for k, v in row.items() if k != "path"}
+         | {"text": f"{row['kind']} {row['name']} in {row['path']}\n{row['source']}"[:EMBED_CHARS]} for row in rows],
     )
 
 
@@ -121,7 +127,8 @@ def _store(conn, name: str, repo_id: int, commit: str, prepared: list[tuple]) ->
                 )
                 fid = file_id.getvalue()[0]
                 rows += [
-                    (fid, c.name[:512], c.kind, c.start_line, c.end_line, c.source, _sha(c.source), commit)
+                    dict(file_id=fid, name=c.name[:512], kind=c.kind, start_line=c.start_line, end_line=c.end_line,
+                         source=c.source, content_hash=_sha(c.source), commit_sha=commit, path=rel)
                     for c in chunks
                 ]
             _insert_symbols(cur, rows)
@@ -135,6 +142,7 @@ def _store(conn, name: str, repo_id: int, commit: str, prepared: list[tuple]) ->
 def ingest(conn, name: str, env: Mapping[str, str] | None = None) -> Summary:
     started = time.monotonic()
     env = environment() if env is None else env
+    semantic.require_model(conn)
     repo_id, root = get_repo(conn, name)
     try:
         git(root, "rev-parse", "--is-inside-work-tree")

@@ -71,9 +71,13 @@ def test_tables_exist_and_version_recorded(conn):
         cur.execute("select table_name from user_tables")
         assert TABLES <= {row[0] for row in cur}
         cur.execute("select version, name from ccctx_migrations order by version")
-        assert cur.fetchall()[:2] == [(1, "core tables"), (2, "symbol commit")]
-        cur.execute("select column_name from user_tab_columns where table_name = 'CCCTX_SYMBOLS'")
-        assert "COMMIT_SHA" in {row[0] for row in cur}
+        assert cur.fetchall()[:3] == [(1, "core tables"), (2, "symbol commit"), (3, "symbol embedding")]
+        cur.execute("select column_name, data_type, nullable from user_tab_columns where table_name = 'CCCTX_SYMBOLS'")
+        columns = {name: (kind, nullable) for name, kind, nullable in cur}
+        assert "COMMIT_SHA" in columns
+        assert columns["EMBEDDING"] == ("VECTOR", "Y")  # 384 x FLOAT32 is checked on real rows in test_semantic
+        cur.execute("select table_name from user_tables where table_name = 'CCCTX_EMBEDDING_MODEL'")
+        assert cur.fetchone()
 
 
 def test_migrate_three_times_changes_nothing(conn):

@@ -103,12 +103,33 @@ def test_list_sorted_with_counts(conn, tmp_path):
             )
             for _ in range(symbols):
                 cur.execute(
-                    "insert into ccctx_symbols (file_id, name, kind, start_line, end_line, source, content_hash)"
-                    " values (:f, 'f', 'function', 1, 1, 'x', :h)",
-                    f=file_id.getvalue()[0], h="0" * 64,
+                    "insert into ccctx_symbols (file_id, name, kind, start_line, end_line, source, content_hash,"
+                    " commit_sha) values (:f, 'f', 'function', 1, 1, 'x', :h, :c)",
+                    f=file_id.getvalue()[0], h="0" * 64, c="a" * 40,
                 )
     conn.commit()
     repos = registry.list_repos(conn)
     assert [r.name for r in repos] == sorted(r.name for r in repos)
     mine = {r.name: (r.files, r.symbols) for r in repos if r.name in (a, b)}
     assert mine == {a: (3, 3), b: (0, 0)}
+
+
+def test_get_repo(conn, tmp_path):
+    n = name()
+    registry.add_repo(conn, tmp_path, n)
+    repo_id, path = registry.get_repo(conn, n)
+    assert isinstance(repo_id, int) and path == tmp_path.resolve()
+
+
+def test_get_repo_unknown_name(conn):
+    with pytest.raises(registry.RegistryError, match="no repository named 't-missing'"):
+        registry.get_repo(conn, "t-missing")
+
+
+def test_get_repo_deleted_directory(conn, tmp_path):
+    n = name()
+    (tmp_path / "gone").mkdir()
+    registry.add_repo(conn, tmp_path / "gone", n)
+    (tmp_path / "gone").rmdir()
+    with pytest.raises(registry.RegistryError, match="does not exist"):
+        registry.get_repo(conn, n)

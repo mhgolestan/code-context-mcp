@@ -8,9 +8,10 @@ dependencies = [
     "mcp[cli]>=1.12,<2",
     "oracledb>=3",
     "python-dotenv>=1",
-    "tree-sitter>=0.25",
+    "tree-sitter>=0.25,<0.26",  # 0.26.0 crashes walking class bodies on Windows
     "tree-sitter-python>=0.25",
     "tree-sitter-go>=0.25",
+    "tree-sitter-javascript>=0.25",
 ]
 
 [project.scripts]

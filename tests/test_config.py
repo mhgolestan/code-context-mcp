@@ -1,6 +1,6 @@
 import pytest
 
-from golestan_code_mcp.config import PROJECT_ROOT, ConfigError, load, repos_dir
+from golestan_code_mcp.config import PROJECT_ROOT, ConfigError, load, max_file_bytes, repos_dir, vendor_dirs
 
 SECRET = "s3cr3t-Pa55"
 BASE = {"DB_USER": "ccctx", "DB_PASSWORD": SECRET}
@@ -44,3 +44,17 @@ def test_environment_wins_over_dotenv(tmp_path, monkeypatch):
     cfg = load(dotenv_path=dotenv)
     assert cfg.db_user == "from_env"
     assert cfg.db_password  # filled from the file or the environment
+
+
+def test_ingest_limits_defaults_and_overrides():
+    assert max_file_bytes({}) == 1048576
+    assert max_file_bytes({"CCCTX_MAX_FILE_BYTES": "2048"}) == 2048
+    assert vendor_dirs({}) == {"vendor", "node_modules", "third_party"}
+    assert vendor_dirs({"CCCTX_VENDOR_DIRS": " deps , ,lib "}) == {"deps", "lib"}
+    assert vendor_dirs({"CCCTX_VENDOR_DIRS": ""}) == set()
+
+
+@pytest.mark.parametrize("bad", ["0", "-5", "1MB"])
+def test_bad_max_file_bytes_named(bad):
+    with pytest.raises(ConfigError, match="CCCTX_MAX_FILE_BYTES"):
+        max_file_bytes({"CCCTX_MAX_FILE_BYTES": bad})

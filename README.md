@@ -80,6 +80,39 @@ Paths are stored absolute, with `~` and `..` resolved. Names are 1 to 64 lowerca
 
 Exit codes: `0` ok, `1` refused input or a missing setting, `2` the database is unreachable or still starting.
 
+## Ingesting a codebase
+
+`ccctx ingest <name>` indexes a registered git repository as it is on disk and replaces whatever was indexed before. Each run prints a summary:
+
+```sh
+uv run ccctx ingest flask
+```
+
+```text
+Scanned   236 files
+Skipped     5 files (5 binary)
+Indexed 1,353 symbols in 1.5s
+Fallback  148 files as line windows (148 no grammar, 0 parse errors)
+```
+
+How files are chosen:
+
+- **Ignored**: files matched by the repository's `.gitignore` rules, nested ones included, as git applies them. Also symbolic links. `.git` is never read.
+- **Vendored**: files under a directory named in `CCCTX_VENDOR_DIRS`, comma-separated, default `vendor,node_modules,third_party`.
+- **Too large**: files over `CCCTX_MAX_FILE_BYTES`, default 1048576.
+- **Binary**: files that contain a NUL byte or are not valid UTF-8.
+
+Python, Go and JavaScript files are cut into one chunk per function, method and class (in Go, also struct and interface types). Each chunk has its exact line range, decorators included, and methods are named `Type.method`. Other text files, and code with a syntax error, are cut into 60-line windows that overlap by 10 lines, with kind `chunk`. Every symbol records the commit the repository was at. A working tree with uncommitted changes is indexed as it is on disk, and a warning is printed. One JSON record per run goes to stderr.
+
+Ingestion only reads files. Git runs with the repository's fsmonitor and hooks disabled, so nothing inside the repository is executed.
+
+Inspect the result:
+
+```sh
+uv run ccctx symbols --repo flask --limit 5      # parsed symbols first; --kind chunk shows windows
+uv run ccctx stats --by-language                 # files, symbols and fallback chunks per repo and language
+```
+
 ## Checking that data persists
 
 `uv run pytest` adds a row to the `ccctx_smoke` table on each run. Note the count, restart the container, and check it again:
@@ -142,6 +175,8 @@ db/startup/01_app_user.sh every start: ensures DB_USER exists in FREEPDB1
 src/golestan_code_mcp/    config, db check, sample cloner, MCP server
   schema.py               ordered, re-runnable migrations
   registry.py             register and list repositories (shared by CLI and MCP)
+  chunker.py              tree-sitter chunks for Python, Go, JavaScript; line-window fallback
+  ingest.py               list files with read-only git, skip rules, store one repository's index
   cli.py                  the ccctx command
-tests/                    pytest suite and parser fixtures
+tests/                    pytest suite and chunker fixtures
 ```

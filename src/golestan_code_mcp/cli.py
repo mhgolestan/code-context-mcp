@@ -1,21 +1,51 @@
-"""ccctx: register and list codebases (contracts/cli.md). Exit 0 ok, 1 refused input, 2 database down."""
+"""ccctx: register, ingest and inspect codebases (contracts/cli.md). Exit 0 ok, 1 refused input, 2 database down."""
 
 import argparse
+import logging
 import sys
 
 import oracledb
 
-from golestan_code_mcp import db, registry, schema
+from golestan_code_mcp import db, ingest, registry, schema
 from golestan_code_mcp.config import ConfigError, load
 
+SKIP_ORDER = ["ignored", "vendored", "binary", "too large"]
+KINDS = ["function", "method", "class", "type", "interface", "chunk"]
 
-def format_table(repos: list[registry.Repo]) -> str:
-    rows = [("NAME", "PATH", "FILES", "SYMBOLS")] + [(r.name, r.path, str(r.files), str(r.symbols)) for r in repos]
-    widths = [max(len(row[i]) for row in rows) for i in range(4)]
+
+def format_table(header: tuple[str, ...], rows: list[tuple], numeric: frozenset[int] = frozenset()) -> str:
+    """Two-space separated columns; columns in `numeric` are right-aligned."""
+    table = [header] + [tuple(str(v) for v in row) for row in rows]
+    widths = [max(len(row[i]) for row in table) for i in range(len(header))]
     return "\n".join(
-        "  ".join([name.ljust(widths[0]), path.ljust(widths[1]), files.rjust(widths[2]), symbols.rjust(widths[3])])
-        for name, path, files, symbols in rows
+        "  ".join(v.rjust(w) if i in numeric else v.ljust(w) for i, (v, w) in enumerate(zip(row, widths))).rstrip()
+        for row in table
     )
+
+
+def format_summary(s: ingest.Summary) -> str:
+    skipped = sum(s.skipped.values())
+    width = max(len(f"{n:,}") for n in (s.scanned, skipped, s.symbols))
+    reasons = ", ".join(f"{s.skipped[r]} {r}" for r in SKIP_ORDER if s.skipped[r])
+    lines = [
+        f"Scanned {s.scanned:>{width},} files",
+        f"Skipped {skipped:>{width},} files" + (f" ({reasons})" if reasons else ""),
+        f"Indexed {s.symbols:>{width},} symbols in {s.seconds:.1f}s",
+    ]
+    if s.no_grammar or s.parse_errors:
+        lines.append(
+            f"Fallback {s.no_grammar + s.parse_errors:>{width - 1},} files as line windows"
+            f" ({s.no_grammar} no grammar, {s.parse_errors} parse errors)"
+        )
+    return "\n".join(lines)
+
+
+def _repo_id(conn, name: str) -> int:
+    with conn.cursor() as cur:
+        row = cur.execute("select id from ccctx_repos where name = :n", n=name).fetchone()
+    if row is None:
+        raise registry.RegistryError(f"no repository named '{name}'")
+    return row[0]
 
 
 def _repo_add(conn, args) -> str:
@@ -25,7 +55,51 @@ def _repo_add(conn, args) -> str:
 
 def _repo_list(conn, args) -> str:
     repos = registry.list_repos(conn)
-    return format_table(repos) if repos else "no repositories registered"
+    if not repos:
+        return "no repositories registered"
+    rows = [(r.name, r.path, r.files, r.symbols) for r in repos]
+    return format_table(("NAME", "PATH", "FILES", "SYMBOLS"), rows, frozenset({2, 3}))
+
+
+def _ingest(conn, args) -> str:
+    summary = ingest.ingest(conn, args.name)
+    if summary.dirty:
+        print("warning: working tree has uncommitted changes; indexed the files as they are on disk", file=sys.stderr)
+    return format_summary(summary)
+
+
+def _symbols(conn, args) -> str:
+    repo_id = _repo_id(conn, args.repo)
+    with conn.cursor() as cur:
+        cur.execute(
+            """select s.name, s.kind, f.language, f.path, s.start_line || '-' || s.end_line
+                 from ccctx_symbols s join ccctx_files f on f.id = s.file_id
+                where f.repo_id = :r and (:k is null or s.kind = :k)
+                order by case when s.kind = 'chunk' then 1 else 0 end, f.path, s.start_line, s.end_line desc
+                fetch first :lim rows only""",
+            r=repo_id, k=args.kind, lim=args.limit,
+        )
+        rows = cur.fetchall()
+    return format_table(("NAME", "KIND", "LANGUAGE", "PATH", "LINES"), rows) if rows else "no symbols"
+
+
+def _stats(conn, args) -> str:
+    repo_id = _repo_id(conn, args.repo) if args.repo else None
+    with conn.cursor() as cur:
+        cur.execute(
+            """select r.name, f.language, count(distinct f.id),
+                      count(case when s.kind <> 'chunk' then 1 end), count(case when s.kind = 'chunk' then 1 end)
+                 from ccctx_repos r join ccctx_files f on f.repo_id = r.id
+                 left join ccctx_symbols s on s.file_id = f.id
+                where (:r is null or r.id = :r)
+                group by r.name, f.language
+                order by r.name, f.language""",
+            r=repo_id,
+        )
+        rows = cur.fetchall()
+    if not rows:
+        return "nothing indexed"
+    return format_table(("REPO", "LANGUAGE", "FILES", "SYMBOLS", "CHUNKS"), rows, frozenset({2, 3, 4}))
 
 
 def _db_migrate(conn, args) -> str:
@@ -34,6 +108,12 @@ def _db_migrate(conn, args) -> str:
     if applied:
         return "\n".join(f"applied {v} {names[v]}" for v in applied)
     return f"schema up to date (version {schema.version(conn)})"
+
+
+def _positive(text: str) -> int:
+    if not text.isdigit() or int(text) < 1:
+        raise argparse.ArgumentTypeError("must be a positive integer")
+    return int(text)
 
 
 def parser() -> argparse.ArgumentParser:
@@ -47,6 +127,21 @@ def parser() -> argparse.ArgumentParser:
     add.set_defaults(run=_repo_add)
     repo.add_parser("list", help="list registered repositories").set_defaults(run=_repo_list)
 
+    ing = groups.add_parser("ingest", help="index a registered repository")
+    ing.add_argument("name")
+    ing.set_defaults(run=_ingest)
+
+    sym = groups.add_parser("symbols", help="list indexed symbols")
+    sym.add_argument("--repo", required=True)
+    sym.add_argument("--limit", type=_positive, default=20)
+    sym.add_argument("--kind", choices=KINDS)
+    sym.set_defaults(run=_symbols)
+
+    st = groups.add_parser("stats", help="index statistics")
+    st.add_argument("--by-language", action="store_true", required=True)
+    st.add_argument("--repo")
+    st.set_defaults(run=_stats)
+
     dbp = groups.add_parser("db", help="database administration").add_subparsers(dest="cmd", required=True)
     dbp.add_parser("migrate", help="apply missing schema migrations").set_defaults(run=_db_migrate)
     return p
@@ -54,6 +149,9 @@ def parser() -> argparse.ArgumentParser:
 
 def main(argv: list[str] | None = None) -> int:
     args = parser().parse_args(argv)
+    handler = logging.StreamHandler(sys.stderr)  # the structured ingest record goes to stderr
+    ingest.log.addHandler(handler)
+    ingest.log.setLevel(logging.INFO)
     try:
         if args.run is _repo_add:  # refuse bad input before touching the database
             registry.validate_name(args.name)
@@ -62,7 +160,7 @@ def main(argv: list[str] | None = None) -> int:
             if args.run is not _db_migrate:
                 schema.migrate(conn)
             print(args.run(conn, args))
-    except (ConfigError, registry.RegistryError) as e:
+    except (ConfigError, registry.RegistryError, ingest.IngestError) as e:
         print(f"error: {e}", file=sys.stderr)
         return 1
     except oracledb.Error as e:
@@ -70,6 +168,8 @@ def main(argv: list[str] | None = None) -> int:
         reason = "database is still starting" if code in db.STARTING_CODES else f"database unreachable: {db.describe(e)}"
         print(f"error: {reason}", file=sys.stderr)
         return 2
+    finally:
+        ingest.log.removeHandler(handler)
     return 0
 
 

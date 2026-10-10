@@ -49,12 +49,15 @@ def add_file(cur, repo_id, path="a.py"):
     )
 
 
-def add_symbol(cur, file_id, kind="function", start=1, end=2):
+SHA = "a" * 40
+
+
+def add_symbol(cur, file_id, kind="function", start=1, end=2, sha=SHA):
     return insert(
         cur,
-        "insert into ccctx_symbols (file_id, name, kind, start_line, end_line, source, content_hash)"
-        " values (:f, 'f', :k, :s, :e, 'def f(): pass', :h)",
-        f=file_id, k=kind, s=start, e=end, h="0" * 64,
+        "insert into ccctx_symbols (file_id, name, kind, start_line, end_line, source, content_hash, commit_sha)"
+        " values (:f, 'f', :k, :s, :e, 'def f(): pass', :h, :c)",
+        f=file_id, k=kind, s=start, e=end, h="0" * 64, c=sha,
     )
 
 
@@ -68,7 +71,9 @@ def test_tables_exist_and_version_recorded(conn):
         cur.execute("select table_name from user_tables")
         assert TABLES <= {row[0] for row in cur}
         cur.execute("select version, name from ccctx_migrations order by version")
-        assert cur.fetchall()[0] == (1, "core tables")
+        assert cur.fetchall()[:2] == [(1, "core tables"), (2, "symbol commit")]
+        cur.execute("select column_name from user_tab_columns where table_name = 'CCCTX_SYMBOLS'")
+        assert "COMMIT_SHA" in {row[0] for row in cur}
 
 
 def test_migrate_three_times_changes_nothing(conn):
@@ -111,4 +116,20 @@ def test_delete_cascades(conn, repo_id):
         assert cur.fetchone()[0] == 0
         cur.execute("select count(*) from ccctx_symbols where file_id = :i", i=file_id)
         assert cur.fetchone()[0] == 0
+    conn.rollback()
+
+
+@pytest.mark.parametrize("sha", ["a" * 40, "0123456789abcdef" * 4])
+def test_commit_sha_accepts_sha1_and_sha256(conn, repo_id, sha):
+    with conn.cursor() as cur:
+        add_symbol(cur, add_file(cur, repo_id), sha=sha)
+    conn.rollback()
+
+
+@pytest.mark.parametrize("sha", ["abc", "A" * 40, "g" * 40, "a" * 41, None])
+def test_commit_sha_rejects_bad_values(conn, repo_id, sha):
+    with conn.cursor() as cur:
+        file_id = add_file(cur, repo_id)
+        with pytest.raises(oracledb.DatabaseError):
+            add_symbol(cur, file_id, sha=sha)
     conn.rollback()

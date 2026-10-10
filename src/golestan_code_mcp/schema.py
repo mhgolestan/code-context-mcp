@@ -7,7 +7,7 @@ so a half-applied migration is finished by the next run.
 
 import oracledb
 
-ALREADY_EXISTS = {"ORA-00955", "ORA-02260", "ORA-02261", "ORA-01408"}
+ALREADY_EXISTS = {"ORA-00955", "ORA-02260", "ORA-02261", "ORA-01408", "ORA-01430", "ORA-02264"}
 
 TRACKING = """create table ccctx_migrations (
   version     number primary key,
@@ -46,6 +46,13 @@ MIGRATIONS: list[tuple[int, str, list[str]]] = [
           constraint ccctx_symbols_lines_ck check (start_line >= 1 and end_line >= start_line)
         )""",
         "create index ccctx_symbols_file_ix on ccctx_symbols (file_id)",
+    ]),
+    (2, "symbol commit", [
+        # Only test rows can exist before ingestion, and a NOT NULL column needs an empty table.
+        "delete from ccctx_symbols",
+        "alter table ccctx_symbols add (commit_sha varchar2(64) not null)",
+        """alter table ccctx_symbols add constraint ccctx_symbols_commit_ck
+          check (regexp_like(commit_sha, '^[0-9a-f]{40}([0-9a-f]{24})?$'))""",
     ]),
 ]
 

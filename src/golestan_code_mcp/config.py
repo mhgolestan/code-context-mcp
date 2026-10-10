@@ -38,6 +38,20 @@ def repos_dir(env: Mapping[str, str]) -> Path:
     return (path if path.is_absolute() else PROJECT_ROOT / path).resolve()
 
 
+def max_file_bytes(env: Mapping[str, str]) -> int:
+    text = (env.get("CCCTX_MAX_FILE_BYTES") or "").strip() or "1048576"
+    if not text.isdigit() or int(text) < 1:
+        raise ConfigError(f"invalid setting: CCCTX_MAX_FILE_BYTES={text!r} (expected a positive integer)")
+    return int(text)
+
+
+def vendor_dirs(env: Mapping[str, str]) -> frozenset[str]:
+    text = env.get("CCCTX_VENDOR_DIRS")
+    if text is None:
+        text = "vendor,node_modules,third_party"
+    return frozenset(part.strip() for part in text.split(",") if part.strip())
+
+
 def load(env: Mapping[str, str] | None = None, dotenv_path: Path | None = PROJECT_ROOT / ".env") -> Config:
     """Build a Config. Errors name settings, never values of secrets."""
     if env is None:

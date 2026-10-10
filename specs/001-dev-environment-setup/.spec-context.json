@@ -1,0 +1,220 @@
+{
+  "workflow": "companion",
+  "specName": "Dev Environment Setup",
+  "branch": "master",
+  "currentStep": "tasks",
+  "status": "ready-to-implement",
+  "history": [
+    {
+      "step": "specify",
+      "substep": null,
+      "kind": "start",
+      "by": "extension",
+      "at": "2026-10-10T10:09:34.202Z"
+    },
+    {
+      "step": "specify",
+      "substep": null,
+      "kind": "complete",
+      "by": "extension",
+      "at": "2026-10-10T10:13:01.620Z"
+    },
+    {
+      "step": "plan",
+      "substep": null,
+      "kind": "start",
+      "by": "extension",
+      "at": "2026-10-10T10:16:56.320Z"
+    },
+    {
+      "step": "plan",
+      "substep": "research",
+      "kind": "complete",
+      "by": "ai",
+      "at": "2026-10-10T10:18:52.753Z"
+    },
+    {
+      "step": "plan",
+      "substep": "design",
+      "kind": "complete",
+      "by": "ai",
+      "at": "2026-10-10T10:21:50.776Z"
+    },
+    {
+      "step": "plan",
+      "substep": null,
+      "kind": "complete",
+      "by": "ai",
+      "at": "2026-10-10T10:21:54.986Z"
+    },
+    {
+      "step": "tasks",
+      "substep": null,
+      "kind": "start",
+      "by": "extension",
+      "at": "2026-10-10T10:26:17.767Z"
+    },
+    {
+      "step": "tasks",
+      "substep": "generate",
+      "kind": "complete",
+      "by": "ai",
+      "at": "2026-10-10T10:27:17.427Z"
+    },
+    {
+      "step": "tasks",
+      "substep": null,
+      "kind": "complete",
+      "by": "ai",
+      "at": "2026-10-10T10:27:18.572Z"
+    }
+  ],
+  "telemetryInstanceId": "71e2753d-caf6-45a8-93f9-792d45103f8b",
+  "selectedAt": "2026-10-10T10:09:34.202Z",
+  "last_action": "living specs evaluated — skipped (not configured)",
+  "size": "oversized",
+  "classification": {
+    "projectedFiles": 12,
+    "projectedTasks": 15,
+    "scopeSignal": "none",
+    "verdict": "oversized"
+  },
+  "coverage": {
+    "FR-001": {
+      "title": "Container definition starts Oracle AI Database 26ai locally with persistent storage via one command",
+      "tasks": [
+        "T010",
+        "T011",
+        "T013",
+        "T023"
+      ]
+    },
+    "FR-002": {
+      "title": "DB settings come from env vars; example env file committed, real one ignored",
+      "tasks": [
+        "T001",
+        "T003",
+        "T007",
+        "T008",
+        "T010"
+      ]
+    },
+    "FR-003": {
+      "title": "Connectivity check confirms login, version, and VECTOR type without printing secrets",
+      "tasks": [
+        "T009",
+        "T012",
+        "T013"
+      ]
+    },
+    "FR-004": {
+      "title": "Python project with pinned deps, one-command install",
+      "tasks": [
+        "T002",
+        "T005",
+        "T006"
+      ]
+    },
+    "FR-005": {
+      "title": "Parser smoke test extracts function and class/type boundaries from Python and Go files",
+      "tasks": [
+        "T014",
+        "T015",
+        "T016"
+      ]
+    },
+    "FR-006": {
+      "title": "Test command always runs parser tests and skips DB tests with a reason when DB is unreachable",
+      "tasks": [
+        "T009",
+        "T016",
+        "T022"
+      ]
+    },
+    "FR-007": {
+      "title": "Idempotent script clones Flask and Gin into a configurable folder outside the project",
+      "tasks": [
+        "T017",
+        "T018"
+      ]
+    },
+    "FR-008": {
+      "title": "Stub MCP server golestan_code_mcp exposes a health tool",
+      "tasks": [
+        "T019",
+        "T020",
+        "T024"
+      ]
+    },
+    "FR-009": {
+      "title": "Health tool returns a result, not an error, when the DB is unreachable",
+      "tasks": [
+        "T019",
+        "T020"
+      ]
+    },
+    "FR-010": {
+      "title": "README documents setup, Inspector, and Claude Code config for PowerShell and POSIX",
+      "tasks": [
+        "T021"
+      ]
+    }
+  },
+  "expectations": [
+    "No ingestion, chunking, or embedding",
+    "No search or retrieval tools beyond the health tool",
+    "No cloud or production deployment"
+  ],
+  "context": [
+    "constitution: v1.0.0 (Oracle AI Database 26ai reference DB, credentials from env, tests first)",
+    "area: greenfield repo, no source yet"
+  ],
+  "intent": "Reproducible local dev environment for golestan_code_mcp: Oracle 26ai container, Python project with parser and MCP SDK, sample repos, stub MCP server",
+  "decisions": [
+    {
+      "decision": "Official container-registry.oracle.com/database/free image via Compose with named volume",
+      "why": "Constitution names 26ai; image has setup-script hook and healthcheck script",
+      "rejected": "gvenzl/oracle-free (community, tags may trail 26ai), adb-free (needs SYS_ADMIN/FUSE)"
+    },
+    {
+      "decision": "First-run script creates app user with DB_DEVELOPER_ROLE from env",
+      "why": "Least privilege, no password in committed SQL",
+      "rejected": "Connecting as SYSTEM"
+    },
+    {
+      "decision": "oracledb thin mode with 3 s connect timeout",
+      "why": "No Instant Client on Windows, VECTOR support, fast health when DB down",
+      "rejected": "Thick mode, SQLAlchemy"
+    },
+    {
+      "decision": "uv with pyproject, uv.lock, .python-version 3.11",
+      "why": "One-command install with exact pins; avoids Python 3.14 first on PATH",
+      "rejected": "pip + requirements.txt"
+    },
+    {
+      "decision": "mcp[cli] 1.x FastMCP over stdio, tool named health",
+      "why": "Stable widely deployed API, works with mcp dev Inspector",
+      "rejected": "mcp 2.0 MCPServer (newer API)"
+    },
+    {
+      "decision": "tree-sitter + per-language grammar wheels; no parser module yet",
+      "why": "Prebuilt Windows wheels; extraction module waits for ingestion",
+      "rejected": "tree-sitter-languages (unmaintained)"
+    },
+    {
+      "decision": "All scripts as Python console entry points run via uv run",
+      "why": "Same command in PowerShell and POSIX",
+      "rejected": "Paired .ps1 and .sh scripts"
+    }
+  ],
+  "step_summaries": {
+    "plan": {
+      "summary": "Plan: Compose Oracle 26ai Free + uv Python 3.11 package with check-db, clone-samples and stdio MCP server exposing health",
+      "key_finding": "Docker daemon (Rancher Desktop) is not running yet; python3 shim on PATH mangles quoted args, use py -3 or uv run"
+    },
+    "tasks": {
+      "summary": "25 tasks: Setup, Foundational (config), US1 DB, US2 parser, US3 samples, US4 MCP health (after US1), Polish"
+    }
+  },
+  "approach": "Compose runs Oracle AI Database 26ai Free with a named volume and a first-run app-user script. A uv-managed Python 3.11 package pins oracledb, tree-sitter grammars and mcp, and exposes three console commands: golestan-check-db, golestan-clone-samples and the golestan-code-mcp stdio server with a health tool."
+}

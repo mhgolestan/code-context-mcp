@@ -17,6 +17,7 @@ dependencies = [
 golestan-code-mcp = "golestan_code_mcp.server:main"
 golestan-check-db = "golestan_code_mcp.db:main"
 golestan-clone-samples = "golestan_code_mcp.samples:main"
+ccctx = "golestan_code_mcp.cli:main"
 
 [dependency-groups]
 dev = ["pytest>=8"]

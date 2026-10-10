@@ -6,7 +6,7 @@ import time
 import pytest
 from mcp.shared.memory import create_connected_server_and_client_session
 
-from golestan_code_mcp import __version__, db
+from golestan_code_mcp import __version__, db, registry, schema
 from golestan_code_mcp.config import load
 from golestan_code_mcp.server import mcp
 
@@ -16,17 +16,22 @@ async def _session(action):
         return await action(client)
 
 
-def call_health():
-    result = asyncio.run(_session(lambda c: c.call_tool("health", {})))
+def call(tool):
+    result = asyncio.run(_session(lambda c: c.call_tool(tool, {})))
     assert not result.isError
     return result.structuredContent
 
 
-def test_lists_one_health_tool():
+def call_health():
+    return call("health")
+
+
+def test_lists_health_and_list_repositories():
     tools = asyncio.run(_session(lambda c: c.list_tools())).tools
-    assert [t.name for t in tools] == ["health"]
-    assert tools[0].description
-    assert tools[0].inputSchema.get("properties", {}) == {}
+    assert [t.name for t in tools] == ["health", "list_repositories"]
+    for tool in tools:
+        assert tool.description
+        assert tool.inputSchema.get("properties", {}) == {}
 
 
 def test_reachable_when_database_up():
@@ -59,3 +64,25 @@ def test_missing_password_named(monkeypatch):
     health = call_health()
     assert health["database"] == "unreachable"
     assert "DB_PASSWORD" in health["reason"]
+
+
+def test_list_repositories_matches_registry():
+    try:
+        conn = db.connect(load())
+    except Exception:
+        pytest.skip("database unreachable")
+    with conn:
+        schema.migrate(conn)
+        expected = [vars(r) for r in registry.list_repos(conn)]
+    assert call("list_repositories") == {"database": "reachable", "reason": None, "repositories": expected}
+
+
+def test_list_repositories_unreachable_is_a_result(monkeypatch):
+    monkeypatch.setenv("DB_PORT", "1")
+    monkeypatch.setenv("DB_PASSWORD", "Not-A-Real-Pw-42")
+    started = time.monotonic()
+    result = call("list_repositories")
+    assert time.monotonic() - started < 5
+    assert result["database"] == "unreachable" and result["reason"]
+    assert result["repositories"] == []
+    assert "Not-A-Real-Pw-42" not in result["reason"]

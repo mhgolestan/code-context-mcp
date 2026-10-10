@@ -24,10 +24,12 @@ cp .env.example .env            # POSIX
 
 `.env` is ignored by git. No script prints its passwords.
 
-**2. Start the database.** The first start creates the database and the application user, which takes a few minutes.
+**2. Start the database.** It runs as the container `oracle26ai` on port 1521. The first start creates the database and the application user, which takes a minute or two.
 
 ```sh
 docker compose up -d
+docker ps
+docker logs oracle26ai | tail -5     # look for DATABASE IS READY TO USE!
 ```
 
 If port 1521 is taken, set `DB_PORT` in `.env` before starting.
@@ -58,6 +60,26 @@ uv run golestan-clone-samples
 uv run pytest
 ```
 
+## Registering codebases
+
+`ccctx` records the codebases to index. The schema (tables `ccctx_repos`, `ccctx_files`, `ccctx_symbols` and `ccctx_migrations`) is created the first time any `ccctx` command runs, or explicitly with `uv run ccctx db migrate`.
+
+```sh
+uv run ccctx repo add ../ccctx-repos/flask --name flask
+uv run ccctx repo add ../ccctx-repos/gin --name gin
+uv run ccctx repo list
+```
+
+```text
+NAME   PATH                         FILES  SYMBOLS
+flask  /home/you/ccctx-repos/flask      0        0
+gin    /home/you/ccctx-repos/gin        0        0
+```
+
+Paths are stored absolute, with `~` and `..` resolved. Names are 1 to 64 lowercase letters, digits, `-` or `_`. A name or directory can be registered only once. Registering only checks that the path is a directory; it never reads or runs anything inside it.
+
+Exit codes: `0` ok, `1` refused input or a missing setting, `2` the database is unreachable or still starting.
+
 ## Checking that data persists
 
 `uv run pytest` adds a row to the `ccctx_smoke` table on each run. Note the count, restart the container, and check it again:
@@ -73,7 +95,12 @@ The second count matches the first. `docker compose down` also keeps the data. O
 
 ## The MCP server
 
-The server talks MCP over standard input and output. It has one tool, `health`, which returns the server name, version and whether the database is reachable. A stopped database gives `"database": "unreachable"` with a reason, not an error.
+The server talks MCP over standard input and output. It has two tools:
+
+- `health` returns the server name, version and whether the database is reachable.
+- `list_repositories` returns the registered repositories with their paths and file and symbol counts, the same as `ccctx repo list`.
+
+A stopped database gives `"database": "unreachable"` with a reason, not an error.
 
 **MCP Inspector:**
 
@@ -113,5 +140,8 @@ Then run `/mcp` in Claude Code and ask it to call the `health` tool.
 compose.yaml              Oracle AI Database 26ai Free, named volume oradata
 db/startup/01_app_user.sh every start: ensures DB_USER exists in FREEPDB1
 src/golestan_code_mcp/    config, db check, sample cloner, MCP server
+  schema.py               ordered, re-runnable migrations
+  registry.py             register and list repositories (shared by CLI and MCP)
+  cli.py                  the ccctx command
 tests/                    pytest suite and parser fixtures
 ```

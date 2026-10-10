@@ -6,7 +6,7 @@ import oracledb
 from mcp.server.fastmcp import FastMCP
 from pydantic import BaseModel
 
-from golestan_code_mcp import __version__, db
+from golestan_code_mcp import __version__, db, registry, schema
 from golestan_code_mcp.config import ConfigError, load
 
 NAME = "golestan_code_mcp"
@@ -29,6 +29,32 @@ def health() -> Health:
     except oracledb.Error as e:
         return Health(server=NAME, version=__version__, database="unreachable", reason=db.describe(e))
     return Health(server=NAME, version=__version__, database="reachable", reason=None)
+
+
+class RepoInfo(BaseModel):
+    name: str
+    path: str
+    files: int
+    symbols: int
+
+
+class RepoList(BaseModel):
+    database: Literal["reachable", "unreachable"]
+    reason: str | None
+    repositories: list[RepoInfo]
+
+
+@mcp.tool(description="List the registered repositories with their paths and how many files and symbols each holds.")
+def list_repositories() -> RepoList:
+    try:
+        with db.connect(load()) as conn:
+            schema.migrate(conn)
+            repos = registry.list_repos(conn)
+    except ConfigError as e:
+        return RepoList(database="unreachable", reason=str(e), repositories=[])
+    except oracledb.Error as e:
+        return RepoList(database="unreachable", reason=db.describe(e), repositories=[])
+    return RepoList(database="reachable", reason=None, repositories=[RepoInfo(**vars(r)) for r in repos])
 
 
 def main() -> None:

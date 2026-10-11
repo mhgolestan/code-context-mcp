@@ -17,12 +17,13 @@ from pathlib import Path, PurePosixPath
 
 import oracledb
 
-from golestan_code_mcp import chunker, semantic
+from golestan_code_mcp import chunker, graph, semantic
 from golestan_code_mcp.config import environment, max_file_bytes, vendor_dirs
 from golestan_code_mcp.registry import get_repo
 
 log = logging.getLogger("golestan_code_mcp.ingest")
 
+EXTRACT_VERSION = 1  # the call and import extraction rules; a repository stored under others is re-read
 GIT_SAFE = ["-c", "core.fsmonitor=false", "-c", f"core.hooksPath={os.devnull}", "--no-optional-locks"]
 
 
@@ -130,18 +131,18 @@ def _insert_symbols(cur, rows: list[dict]) -> None:
     )
 
 
-def _lock(cur, name: str, repo_id: int) -> tuple[str | None, bool | None, dict[str, str]]:
-    """Lock the repository row; return its recorded revision, dirty flag and the stored path to hash map."""
+def _lock(cur, name: str, repo_id: int) -> tuple[str | None, bool | None, int | None, dict[str, str]]:
+    """Lock the repository row; return its recorded revision, dirty flag, extract version and path to hash map."""
     try:
         cur.execute("select id from ccctx_repos where id = :i for update nowait", i=repo_id)
     except oracledb.DatabaseError as e:
         if getattr(e.args[0], "full_code", "") == "ORA-00054":
             raise IngestError(f"another ingest of '{name}' is running") from None
         raise
-    recorded, was_dirty = cur.execute(
-        "select indexed_commit, indexed_dirty from ccctx_repos where id = :i", i=repo_id).fetchone()
+    recorded, was_dirty, version = cur.execute(
+        "select indexed_commit, indexed_dirty, extract_version from ccctx_repos where id = :i", i=repo_id).fetchone()
     stored = dict(cur.execute("select path, content_hash from ccctx_files where repo_id = :i", i=repo_id))
-    return recorded, was_dirty, stored
+    return recorded, was_dirty, version, stored
 
 
 def _full_reason(root: Path, name: str, recorded: str | None, stored: dict) -> tuple[bool, str | None]:
@@ -169,14 +170,14 @@ def _prepare(files: dict[str, str]) -> tuple[list[tuple], int, int]:
     prepared, no_grammar, parse_errors = [], 0, 0
     for rel, text in sorted(files.items()):
         language = chunker.detect_language(rel)
-        items = chunker.chunk(language, text)
-        if items is None:
+        parsed = chunker.parse(language, text)
+        if parsed is None:  # line windows have no calls or imports
             if language in chunker.GRAMMARS:
                 parse_errors += 1
             else:
                 no_grammar += 1
-            items = chunker.windows(PurePosixPath(rel).name, text)
-        prepared.append((rel, language, text, items))
+            parsed = chunker.windows(PurePosixPath(rel).name, text), [], []
+        prepared.append((rel, language, text, *parsed))
     return prepared, no_grammar, parse_errors
 
 
@@ -207,7 +208,8 @@ def _keep_unchanged(cur, file_id: int, commit: str, rows: list[dict]) -> list[di
 
 def _write(cur, repo_id: int, commit: str, dirty: bool, prepared: list[tuple], delete: list[str] | None,
            changed: set[str]) -> int:
-    """Delete the given paths (all of them for None), store the prepared files, record the revision.
+    """Delete the given paths (all of them for None), store the prepared files and their refs, record the
+    revision and rebuild the repository's edges.
 
     Files in `changed` are updated in place. Returns the number of symbols inserted, which the index embeds.
     """
@@ -216,8 +218,8 @@ def _write(cur, repo_id: int, commit: str, dirty: bool, prepared: list[tuple], d
     elif delete:
         cur.executemany("delete from ccctx_files where repo_id = :r and path = :p",
                         [{"r": repo_id, "p": rel} for rel in delete])  # symbols go with them (on delete cascade)
-    rows = []
-    for rel, language, text, chunks in prepared:
+    rows, fids = [], {}
+    for rel, language, text, chunks, _, _ in prepared:
         file_id = cur.var(int)
         if rel in changed:
             cur.execute("update ccctx_files set language = :l, content_hash = :h where repo_id = :r and path = :p"
@@ -228,7 +230,7 @@ def _write(cur, repo_id: int, commit: str, dirty: bool, prepared: list[tuple], d
                 " values (:r, :p, :l, :h) returning id into :i",
                 r=repo_id, p=rel, l=language, h=_sha(text), i=file_id,
             )
-        fid = file_id.getvalue()[0]
+        fid = fids[rel] = file_id.getvalue()[0]
         file_rows = [
             dict(file_id=fid, name=c.name[:512], kind=c.kind, start_line=c.start_line, end_line=c.end_line,
                  source=c.source, content_hash=_sha(c.source), commit_sha=commit, path=rel)
@@ -236,9 +238,35 @@ def _write(cur, repo_id: int, commit: str, dirty: bool, prepared: list[tuple], d
         ]
         rows += _keep_unchanged(cur, fid, commit, file_rows) if rel in changed else file_rows
     _insert_symbols(cur, rows)
-    cur.execute("update ccctx_repos set indexed_commit = :c, indexed_dirty = :d, indexed_at = systimestamp"
-                " where id = :i", c=commit, d=dirty, i=repo_id)
+    _insert_refs(cur, repo_id, prepared, fids, changed)
+    cur.execute("update ccctx_repos set indexed_commit = :c, indexed_dirty = :d, indexed_at = systimestamp,"
+                " extract_version = :v where id = :i", c=commit, d=dirty, v=EXTRACT_VERSION, i=repo_id)
+    graph.rebuild(cur, repo_id)
     return len(rows)
+
+
+def _insert_refs(cur, repo_id: int, prepared: list[tuple], fids: dict[str, int], changed: set[str]) -> None:
+    """Replace the call and import refs of every file read, each caller mapped to its kept or inserted symbol."""
+    gone = [{"f": fids[rel]} for rel in changed if rel in fids]
+    if gone:
+        cur.executemany("delete from ccctx_call_refs where file_id = :f", gone)
+        cur.executemany("delete from ccctx_import_refs where file_id = :f", gone)
+    ids = {(fid, name): sid for sid, fid, name in cur.execute(
+        "select s.id, s.file_id, s.name from ccctx_symbols s join ccctx_files f on f.id = s.file_id"
+        " where f.repo_id = :r and s.kind <> 'chunk'", r=repo_id)}
+    calls, imports = [], []
+    for rel, _, _, _, file_calls, file_imports in prepared:
+        fid = fids[rel]
+        calls += [{"f": fid, "c": ids.get((fid, c.caller[:512])) if c.caller else None, "n": c.name[:512],
+                   "o": c.form, "r": c.receiver and c.receiver[:512], "l": c.line} for c in file_calls]
+        imports += [{"f": fid, "m": i.module[:1024], "v": i.rel_level, "b": i.bound and i.bound[:512]}
+                    for i in file_imports]
+    if calls:
+        cur.executemany("insert into ccctx_call_refs (file_id, caller_id, name, form, receiver, line)"
+                        " values (:f, :c, :n, :o, :r, :l)", calls)
+    if imports:
+        cur.executemany("insert into ccctx_import_refs (file_id, module, rel_level, bound) values (:f, :m, :v, :b)",
+                        imports)
 
 
 def ingest(conn, name: str, env: Mapping[str, str] | None = None, full: bool = False) -> Summary:
@@ -259,7 +287,8 @@ def ingest(conn, name: str, env: Mapping[str, str] | None = None, full: bool = F
 
     with conn.cursor() as cur:
         try:
-            recorded, was_dirty, stored = _lock(cur, name, repo_id)
+            recorded, was_dirty, version, stored = _lock(cur, name, repo_id)
+            stale = version != EXTRACT_VERSION  # refs from older rules, or none: re-read every listed file
             note = None
             if not full:
                 full, note = _full_reason(root, name, recorded, stored)
@@ -268,16 +297,16 @@ def ingest(conn, name: str, env: Mapping[str, str] | None = None, full: bool = F
                 delete, removed = None, []
                 mode, added, changed, unchanged = "full", len(files), 0, 0
             else:
-                candidates, listed = _candidates(root, recorded, bool(was_dirty))
+                candidates, listed = _candidates(root, recorded, bool(was_dirty) or stale)
                 readable, skipped = discover(root, env, candidates)
                 # gone from git's listing (deleted, renamed away, newly ignored), or now gone or skipped on disk
                 removed = sorted({rel for rel in stored if rel not in listed}
                                  | {rel for rel in candidates if rel in stored and rel not in readable})
-                files = {rel: text for rel, text in readable.items() if stored.get(rel) != _sha(text)}
+                files = {rel: text for rel, text in readable.items() if stale or stored.get(rel) != _sha(text)}
                 changed = sum(rel in stored for rel in files)
                 added, unchanged = len(files) - changed, len(stored) - changed - len(removed)
                 delete = removed
-                current = commit == recorded and not files and not removed and bool(was_dirty) == dirty
+                current = not stale and commit == recorded and not files and not removed and bool(was_dirty) == dirty
                 mode = "current" if current else "incremental"
             prepared, no_grammar, parse_errors = _prepare(files)
             if mode == "current":

@@ -11,7 +11,7 @@ import oracledb
 from mcp.server.fastmcp import FastMCP
 from pydantic import BaseModel
 
-from golestan_code_mcp import __version__, db, registry, schema, semantic
+from golestan_code_mcp import __version__, db, graph, registry, schema, semantic
 from golestan_code_mcp.config import ConfigError, load
 
 NAME = "golestan_code_mcp"
@@ -123,6 +123,103 @@ def search(question: str, repo: str | None = None, repos: list[str] | None = Non
     except oracledb.Error as e:
         return SearchResults(status="unavailable", reason=db.describe(e), results=[])
     return SearchResults(status="ok", reason=None, results=[SearchHit(**vars(h)) for h in hits])
+
+
+LIMIT = 200  # graph tools return at most this many rows; truncated says when more existed
+
+
+class CallerHit(BaseModel):
+    repo: str
+    kind: str
+    name: str
+    path: str
+    line: int
+    callee: str
+
+
+class CalleeHit(BaseModel):
+    caller: str
+    line: int
+    repo: str
+    kind: str
+    name: str
+    path: str
+    start_line: int
+    end_line: int
+
+
+class ImpactHit(BaseModel):
+    hops: int
+    repo: str
+    kind: str
+    name: str
+    path: str
+    start_line: int
+    end_line: int
+
+
+class CallerResults(BaseModel):
+    status: Literal["ok", "unavailable"]
+    reason: str | None
+    results: list[CallerHit]
+    truncated: bool
+
+
+class CalleeResults(CallerResults):
+    results: list[CalleeHit]
+
+
+class ImpactResults(CallerResults):
+    results: list[ImpactHit]
+
+
+def _graph(answer, model, query, name: str, repo: str | None, repos: list[str] | None, *args):
+    """Run one graph question with the CLI's refusals, as an envelope of at most LIMIT rows."""
+    names = list(dict.fromkeys((repos or []) + ([repo] if repo else []))) or None
+    try:
+        graph.check_name(name)
+        if query is graph.impact:
+            graph.check_depth(*args)  # both refused before connecting
+        with db.connect(load()) as conn:
+            schema.migrate(conn)
+            rows = query(conn, name, *args, names)
+    except ValueError as e:  # ConfigError and RegistryError are ValueErrors
+        return answer(status="unavailable", reason=str(e), results=[], truncated=False)
+    except oracledb.Error as e:
+        return answer(status="unavailable", reason=db.describe(e), results=[], truncated=False)
+    return answer(status="ok", reason=None, results=[model(**vars(r)) for r in rows[:LIMIT]],
+                  truncated=len(rows) > LIMIT)
+
+
+@mcp.tool(
+    description="List every call to the symbols matching name (bare like url_for, or qualified like Flask.url_for; "
+    "case-sensitive), with the calling symbol, repository, path and line. Calls come from the parse tree, so "
+    "comments, docstrings and strings never appear. A module-level call has kind file and name (module). "
+    "repos (or repo) limits the question to those repositories. At most 200 results; truncated says when more exist."
+)
+@_logged
+def callers(name: str, repo: str | None = None, repos: list[str] | None = None) -> CallerResults:
+    return _graph(CallerResults, CallerHit, graph.callers, name, repo, repos)
+
+
+@mcp.tool(
+    description="List the indexed symbols called from the body of each definition matching name, with the line of "
+    "each call and where the called symbol is defined. Calls into code that is not indexed are not listed. "
+    "repos (or repo) limits the question to those repositories. At most 200 results; truncated says when more exist."
+)
+@_logged
+def calls(name: str, repo: str | None = None, repos: list[str] | None = None) -> CalleeResults:
+    return _graph(CalleeResults, CalleeHit, graph.calls, name, repo, repos)
+
+
+@mcp.tool(
+    description="Blast radius: list every symbol that reaches name through calls in at most depth hops (1 to 5, "
+    "default 3), once each at its shortest distance, nearest first. repos (or repo) limits the question to those "
+    "repositories. At most 200 results; truncated says when more exist."
+)
+@_logged
+def impact(name: str, depth: int = 3, repo: str | None = None, repos: list[str] | None = None) -> ImpactResults:
+    return _graph(ImpactResults, ImpactHit, graph.impact, name, repo, repos, depth)
 
 
 def main() -> None:

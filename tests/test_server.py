@@ -8,7 +8,7 @@ import time
 import pytest
 from mcp.shared.memory import create_connected_server_and_client_session
 
-from golestan_code_mcp import __version__, db, registry, schema, semantic
+from golestan_code_mcp import __version__, db, graph, registry, schema, semantic, server
 from golestan_code_mcp.config import load
 from golestan_code_mcp.server import mcp
 
@@ -28,14 +28,18 @@ def call_health():
     return call("health")
 
 
-def test_lists_three_tools():
+def test_lists_the_tools():
     tools = {t.name: t for t in asyncio.run(_session(lambda c: c.list_tools())).tools}
-    assert list(tools) == ["health", "list_repositories", "search"]
+    assert list(tools) == ["health", "list_repositories", "search", "callers", "calls", "impact"]
     assert all(t.description for t in tools.values())
     assert tools["health"].inputSchema.get("properties", {}) == {}
     assert tools["list_repositories"].inputSchema.get("properties", {}) == {}
     schema_ = tools["search"].inputSchema
     assert set(schema_["properties"]) == {"question", "repo", "repos", "mode"} and schema_["required"] == ["question"]
+    for tool in ("callers", "calls"):
+        assert set(tools[tool].inputSchema["properties"]) == {"name", "repo", "repos"}
+    assert set(tools["impact"].inputSchema["properties"]) == {"name", "depth", "repo", "repos"}
+    assert all(tools[t].inputSchema["required"] == ["name"] for t in ("callers", "calls", "impact"))
 
 
 def test_reachable_when_database_up():
@@ -142,14 +146,16 @@ def test_each_tool_call_is_logged(monkeypatch, caplog):
     call("health")
     call("list_repositories")
     call("search", question="secret_marker_question")
+    call("callers", name="secret_marker_name")
     records = [json.loads(r.getMessage()) for r in caplog.records if r.name == "golestan_code_mcp.server"]
     assert [(r["event"], r["tool"], r["status"], r["results"]) for r in records] == [
         ("tool", "health", "unreachable", None),
         ("tool", "list_repositories", "unreachable", 0),
         ("tool", "search", "unavailable", 0),
+        ("tool", "callers", "unavailable", 0),
     ]
     assert all(isinstance(r["ms"], int) for r in records)
-    assert "secret_marker_question" not in caplog.text  # never the question or source text
+    assert "secret_marker_question" not in caplog.text and "secret_marker_name" not in caplog.text  # never the question or source text
 
 
 def test_search_unreachable_is_a_result(monkeypatch):
@@ -159,4 +165,71 @@ def test_search_unreachable_is_a_result(monkeypatch):
     result = call("search", question="routing")
     assert time.monotonic() - started < 5
     assert result["status"] == "unavailable" and result["results"] == []
+    assert "Not-A-Real-Pw-42" not in result["reason"]
+
+
+# --- callers, calls and impact (007 contracts/graph-tools.md) ---------------------------------------------------
+
+GRAPH_CALLS = [
+    ("callers", {"name": "url_for", "repos": ["flask"]}),
+    ("callers", {"name": "Flask.url_for", "repo": "flask"}),
+    ("calls", {"name": "url_for", "repos": ["flask"]}),
+    ("impact", {"name": "url_for", "repos": ["flask"]}),
+    ("impact", {"name": "url_for", "depth": 1, "repos": ["flask"]}),
+]
+
+
+def core(tool, arguments):
+    names = list(dict.fromkeys((arguments.get("repos") or []) + ([arguments["repo"]] if "repo" in arguments else [])))
+    extra = [arguments.get("depth", 3)] if tool == "impact" else []
+    try:
+        with db.connect(load()) as conn:
+            return [vars(r) for r in getattr(graph, tool)(conn, arguments["name"], *extra, names or None)]
+    except Exception as e:  # database down or flask not indexed here
+        pytest.skip(f"flask not indexed: {e}")
+
+
+@pytest.mark.parametrize(("tool", "arguments"), GRAPH_CALLS)
+def test_graph_tools_match_core(tool, arguments):
+    expected = core(tool, arguments)
+    result = call(tool, **arguments)
+    assert result == {"status": "ok", "reason": None, "results": expected[:200], "truncated": len(expected) > 200}
+
+
+def test_graph_results_are_capped(monkeypatch):
+    expected = core("callers", {"name": "url_for", "repos": ["flask"]})
+    if len(expected) < 2:
+        pytest.skip("flask graph not built")
+    monkeypatch.setattr(server, "LIMIT", 1)
+    result = call("callers", name="url_for", repos=["flask"])
+    assert result["results"] == expected[:1] and result["truncated"] is True
+
+
+@pytest.mark.parametrize(("tool", "arguments", "reason"), [
+    ("callers", {"name": "  "}, "the name is empty"),
+    ("impact", {"name": "url_for", "depth": 0}, "depth must be between 1 and 5"),
+    ("impact", {"name": "url_for", "depth": 6}, "depth must be between 1 and 5"),
+])
+def test_graph_input_refused_before_connecting(monkeypatch, tool, arguments, reason):
+    monkeypatch.setenv("DB_PORT", "1")
+    assert call(tool, **arguments) == {"status": "unavailable", "reason": reason, "results": [], "truncated": False}
+
+
+@pytest.mark.parametrize(("tool", "arguments", "reason"), [
+    ("calls", {"name": "url_for", "repo": "t-missing"}, "no repository named 't-missing'"),
+    ("callers", {"name": "t_no_such_symbol_anywhere"}, "no symbol named 't_no_such_symbol_anywhere'"),
+])
+def test_graph_refusals_are_results(tool, arguments, reason):
+    try:
+        db.connect(load()).close()
+    except Exception:
+        pytest.skip("database unreachable")
+    assert call(tool, **arguments) == {"status": "unavailable", "reason": reason, "results": [], "truncated": False}
+
+
+def test_graph_unreachable_is_a_result(monkeypatch):
+    monkeypatch.setenv("DB_PORT", "1")
+    monkeypatch.setenv("DB_PASSWORD", "Not-A-Real-Pw-42")
+    result = call("impact", name="url_for")
+    assert result["status"] == "unavailable" and result["results"] == [] and result["truncated"] is False
     assert "Not-A-Real-Pw-42" not in result["reason"]

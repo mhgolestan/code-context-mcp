@@ -9,7 +9,7 @@ from dataclasses import replace
 
 import pytest
 
-from golestan_code_mcp import cli, db, ingest, registry, semantic
+from golestan_code_mcp import cli, db, graph, ingest, registry, semantic
 from golestan_code_mcp.config import load
 
 FAKE_PW = "Not-A-Real-Pw-42"
@@ -331,3 +331,80 @@ def test_note_goes_to_stderr(live, capsys, monkeypatch):
     code, out, err = run(capsys, "ingest", "flask")
     assert code == 0 and out.startswith("Scanned")
     assert "note: no recorded revision for 'flask'; indexing in full" in err
+
+
+# --- callers, calls, impact (007) ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def graphed(model, capsys, tmp_path):
+    root = tmp_path / "g"
+    root.mkdir()
+    (root / "g.py").write_text("def a():\n    return 1\n\n\ndef b():\n    return a()\n\n\na()\n")
+    for args in (["init", "-q"], ["add", "-A"], ["commit", "-q", "-m", "init"]):
+        subprocess.run(["git", "-c", "user.email=t@t", "-c", "user.name=t", *args], cwd=root, check=True,
+                       capture_output=True)
+    n = f"t-{uuid.uuid4().hex[:8]}"
+    run(capsys, "repo", "add", str(root), "--name", n)
+    assert run(capsys, "ingest", n)[0] == 0
+    return n
+
+
+def test_graph_tables(graphed, capsys):
+    n = graphed
+    code, out, _ = run(capsys, "callers", "a", "--repo", n)
+    header, *rows = out.splitlines()
+    assert code == 0 and header.split() == ["CALLER", "KIND", "REPO", "PATH", "LINE", "CALLS"]
+    assert [r.split() for r in rows] == [["b", "function", n, "g.py", "6", "a"], ["(module)", "file", n, "g.py", "9", "a"]]
+
+    code, out, _ = run(capsys, "calls", "b", "--repo", n)
+    header, *rows = out.splitlines()
+    assert code == 0 and header.split() == ["FROM", "LINE", "CALLEE", "KIND", "REPO", "PATH", "LINES"]
+    assert [r.split() for r in rows] == [["b", "6", "a", "function", n, "g.py", "1-2"]]
+
+    code, out, _ = run(capsys, "impact", "a", "--repo", n, "--depth", "1")
+    header, *rows = out.splitlines()
+    assert code == 0 and header.split() == ["HOPS", "NAME", "KIND", "REPO", "PATH", "LINES"]
+    assert [r.split() for r in rows] == [["1", "b", "function", n, "g.py", "5-6"]]
+
+
+@pytest.mark.parametrize(("argv", "message"), [
+    (["callers", "b"], "no callers of 'b'"),
+    (["calls", "a"], "'a' calls no indexed symbols"),
+    (["impact", "b"], "nothing calls 'b'"),
+])
+def test_graph_empty_results(graphed, capsys, argv, message):
+    code, out, _ = run(capsys, *argv, "--repo", graphed)
+    assert code == 0 and out.strip() == message
+
+
+@pytest.mark.parametrize("command", ["callers", "calls", "impact"])
+def test_graph_unknown_name_exits_1(graphed, capsys, command):
+    code, out, err = run(capsys, command, "zzz_missing", "--repo", graphed)
+    assert code == 1 and out == "" and "error: no symbol named 'zzz_missing'" in err
+
+
+def test_graph_repo_flags_and_default_depth(live, capsys, monkeypatch):
+    seen = []
+    monkeypatch.setattr(graph, "callers", lambda conn, name, repos=None: seen.append(("callers", repos)) or [])
+    monkeypatch.setattr(graph, "calls", lambda conn, name, repos=None: seen.append(("calls", repos)) or [])
+    monkeypatch.setattr(graph, "impact", lambda conn, name, depth=3, repos=None: seen.append((depth, repos)) or [])
+    run(capsys, "callers", "x", "--repo", "t-a", "--repo", "t-a,t-b")
+    run(capsys, "calls", "x")
+    run(capsys, "impact", "x", "--repo", "t-a")
+    run(capsys, "impact", "x", "--depth", "5")
+    assert seen == [("callers", ["t-a", "t-b"]), ("calls", None), (3, ["t-a"]), (5, None)]
+
+
+@pytest.mark.parametrize("depth", ["0", "6", "-1", "x", "2.5"])
+def test_bad_depth_refused_before_connecting(capsys, monkeypatch, depth):
+    monkeypatch.setenv("DB_PORT", "1")
+    code, out, err = run(capsys, "impact", "url_for", "--depth", depth)
+    assert code == 1 and out == "" and err.strip() == "error: depth must be between 1 and 5"
+
+
+@pytest.mark.parametrize("command", ["callers", "calls", "impact"])
+def test_graph_empty_name_refused_before_connecting(capsys, monkeypatch, command):
+    monkeypatch.setenv("DB_PORT", "1")
+    code, out, err = run(capsys, command, " ")
+    assert code == 1 and out == "" and err.strip() == "error: the name is empty"

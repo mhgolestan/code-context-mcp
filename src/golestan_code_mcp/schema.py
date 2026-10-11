@@ -86,6 +86,67 @@ MIGRATIONS: list[tuple[int, str, list[str]]] = [
         """alter table ccctx_repos add constraint ccctx_repos_indexed_ck
           check (indexed_commit is null or regexp_like(indexed_commit, '^[0-9a-f]{40}([0-9a-f]{24})?$'))""",
     ]),
+    # The calls and imports each parse saw, the edges resolved from them, and a property graph over files and symbols.
+    (6, "code graph", [
+        "alter table ccctx_repos add (extract_version number)",
+        """create table ccctx_call_refs (
+          id         number generated always as identity primary key,
+          file_id    number not null references ccctx_files (id) on delete cascade,
+          caller_id  number references ccctx_symbols (id) on delete cascade,
+          name       varchar2(512) not null,
+          form       varchar2(4) not null,
+          receiver   varchar2(512),
+          line       number not null,
+          constraint ccctx_call_refs_form_ck check (form in ('bare', 'attr')),
+          constraint ccctx_call_refs_line_ck check (line >= 1))""",
+        "create index ccctx_call_refs_file_ix on ccctx_call_refs (file_id)",
+        "create index ccctx_call_refs_caller_ix on ccctx_call_refs (caller_id)",
+        """create table ccctx_import_refs (
+          id         number generated always as identity primary key,
+          file_id    number not null references ccctx_files (id) on delete cascade,
+          module     varchar2(1024) not null,
+          rel_level  number default 0 not null,
+          bound      varchar2(512))""",
+        "create index ccctx_import_refs_file_ix on ccctx_import_refs (file_id)",
+        """create table ccctx_calls (
+          id         number generated always as identity primary key,
+          caller_id  number not null references ccctx_symbols (id) on delete cascade,
+          callee_id  number not null references ccctx_symbols (id) on delete cascade,
+          line       number not null)""",
+        "create index ccctx_calls_caller_ix on ccctx_calls (caller_id)",
+        "create index ccctx_calls_callee_ix on ccctx_calls (callee_id)",
+        """create table ccctx_file_calls (
+          id         number generated always as identity primary key,
+          file_id    number not null references ccctx_files (id) on delete cascade,
+          callee_id  number not null references ccctx_symbols (id) on delete cascade,
+          line       number not null)""",
+        "create index ccctx_file_calls_file_ix on ccctx_file_calls (file_id)",
+        "create index ccctx_file_calls_callee_ix on ccctx_file_calls (callee_id)",
+        """create table ccctx_imports (
+          id           number generated always as identity primary key,
+          importer_id  number not null references ccctx_files (id) on delete cascade,
+          imported_id  number not null references ccctx_files (id) on delete cascade,
+          constraint ccctx_imports_pair_uk unique (importer_id, imported_id))""",
+        "create index ccctx_imports_imported_ix on ccctx_imports (imported_id)",
+        # create or replace: a tolerated ORA-00955 would silently keep an outdated definition.
+        """create or replace property graph ccctx_graph
+          vertex tables (
+            ccctx_files   key (id) label code_file properties (id, repo_id, path),
+            ccctx_symbols key (id) label symbol    properties (id, file_id, name, kind, start_line, end_line))
+          edge tables (
+            ccctx_symbols as ccctx_defines key (id)
+              source key (file_id) references ccctx_files (id)
+              destination key (id) references ccctx_symbols (id) label defines,
+            ccctx_imports key (id)
+              source key (importer_id) references ccctx_files (id)
+              destination key (imported_id) references ccctx_files (id) label imports,
+            ccctx_calls key (id)
+              source key (caller_id) references ccctx_symbols (id)
+              destination key (callee_id) references ccctx_symbols (id) label calls properties (line),
+            ccctx_file_calls key (id)
+              source key (file_id) references ccctx_files (id)
+              destination key (callee_id) references ccctx_symbols (id) label calls properties (line))""",
+    ]),
 ]
 
 

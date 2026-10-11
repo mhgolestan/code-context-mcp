@@ -2,11 +2,12 @@
 
 import argparse
 import logging
+import re
 import sys
 
 import oracledb
 
-from golestan_code_mcp import db, ingest, registry, schema, semantic
+from golestan_code_mcp import db, graph, ingest, registry, schema, semantic
 from golestan_code_mcp.config import environment, load
 
 SKIP_ORDER = ["ignored", "vendored", "binary", "too large"]
@@ -142,6 +143,33 @@ def _search(conn, args) -> str:
     return format_table(header, rows, frozenset({0, 1, 2, 3}))
 
 
+def _callers(conn, args) -> str:
+    results = graph.callers(conn, args.name, _repos(args.repo))
+    if not results:
+        return f"no callers of '{args.name.strip()}'"
+    rows = [(r.name, r.kind, r.repo, r.path, r.line, r.callee) for r in results]
+    return format_table(("CALLER", "KIND", "REPO", "PATH", "LINE", "CALLS"), rows, frozenset({4}))
+
+
+def _calls(conn, args) -> str:
+    results = graph.calls(conn, args.name, _repos(args.repo))
+    if not results:
+        return f"'{args.name.strip()}' calls no indexed symbols"
+    rows = [(r.caller, r.line, r.name, r.kind, r.repo, r.path, f"{r.start_line}-{r.end_line}") for r in results]
+    return format_table(("FROM", "LINE", "CALLEE", "KIND", "REPO", "PATH", "LINES"), rows, frozenset({1}))
+
+
+def _impact(conn, args) -> str:
+    results = graph.impact(conn, args.name, args.depth, _repos(args.repo))
+    if not results:
+        return f"nothing calls '{args.name.strip()}'"
+    rows = [(r.hops, r.name, r.kind, r.repo, r.path, f"{r.start_line}-{r.end_line}") for r in results]
+    return format_table(("HOPS", "NAME", "KIND", "REPO", "PATH", "LINES"), rows, frozenset({0}))
+
+
+GRAPH = (_callers, _calls, _impact)
+
+
 def _db_migrate(conn, args) -> str:
     applied = schema.migrate(conn)
     names = {v: n for v, n, _ in schema.MIGRATIONS}
@@ -189,6 +217,16 @@ def parser() -> argparse.ArgumentParser:
     srch.add_argument("--repo", action="append", help="limit to these repositories; repeat or comma-separate")
     srch.set_defaults(run=_search)
 
+    for run, cmd, text in [(_callers, "callers", "list every call to a symbol"),
+                           (_calls, "calls", "list the indexed symbols a symbol calls"),
+                           (_impact, "impact", "list the symbols a change could affect, by call hops")]:
+        g = groups.add_parser(cmd, help=text)
+        g.add_argument("name")
+        g.add_argument("--repo", action="append", help="limit to these repositories; repeat or comma-separate")
+        if run is _impact:
+            g.add_argument("--depth", default="3", help=f"call hops to follow, 1 to {graph.MAX_DEPTH} (default 3)")
+        g.set_defaults(run=run)
+
     model = groups.add_parser("model", help="embedding model").add_subparsers(dest="cmd", required=True)
     model.add_parser("load", help="download once and load the embedding model").set_defaults(run=_model_load)
 
@@ -212,6 +250,10 @@ def main(argv: list[str] | None = None) -> int:
                 raise ValueError("the question is empty")
             if args.mode not in semantic.MODES:
                 raise ValueError(f"unknown mode '{args.mode}'; valid modes: {', '.join(semantic.MODES)}")
+        if args.run in GRAPH:  # refuse bad input before touching the database
+            graph.check_name(args.name)
+            if args.run is _impact:  # a bad --depth exits 1, not argparse's 2
+                args.depth = graph.check_depth(int(args.depth) if re.fullmatch(r"-?[0-9]+", args.depth) else None)
         conn = db.connect(load())
         with conn:
             if args.run is not _db_migrate:

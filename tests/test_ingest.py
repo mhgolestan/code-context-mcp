@@ -10,7 +10,7 @@ from collections import Counter
 
 import pytest
 
-from golestan_code_mcp import db, ingest, registry, schema, semantic
+from golestan_code_mcp import db, graph, ingest, registry, schema, semantic
 from golestan_code_mcp.config import load
 
 ENV = {"CCCTX_MAX_FILE_BYTES": "2048"}
@@ -179,11 +179,34 @@ def named_ids(conn, name, path):
         return dict(cur.fetchall())
 
 
+RELATIONS = {  # refs and edges by names and paths: symbol ids change when code is edited
+    "call refs": """select f.path, s.name, c.name, c.form, c.receiver, c.line from ccctx_call_refs c
+                      join ccctx_files f on f.id = c.file_id left join ccctx_symbols s on s.id = c.caller_id""",
+    "import refs": """select f.path, i.module, i.rel_level, i.bound from ccctx_import_refs i
+                        join ccctx_files f on f.id = i.file_id""",
+    "calls": """select f.path, s.name, tf.path, t.name, c.line from ccctx_calls c
+                  join ccctx_symbols s on s.id = c.caller_id join ccctx_files f on f.id = s.file_id
+                  join ccctx_symbols t on t.id = c.callee_id join ccctx_files tf on tf.id = t.file_id""",
+    "file calls": """select f.path, tf.path, t.name, c.line from ccctx_file_calls c join ccctx_files f on f.id = c.file_id
+                       join ccctx_symbols t on t.id = c.callee_id join ccctx_files tf on tf.id = t.file_id""",
+    "imports": """select f.path, t.path from ccctx_imports i join ccctx_files f on f.id = i.importer_id
+                    join ccctx_files t on t.id = i.imported_id""",
+}
+
+
+def relations(conn, name):
+    with conn.cursor() as cur:
+        rid = cur.execute("select id from ccctx_repos where name = :n", n=name).fetchone()[0]
+        return {table: sorted(map(repr, cur.execute(sql + " where f.repo_id = :r", r=rid)))
+                for table, sql in RELATIONS.items()}
+
+
 def assert_matches_full(conn, name):
-    """FR-006, SC-005: the incremental index is what a full rebuild of the same tree stores."""
-    before = content(conn, name)
+    """FR-006, SC-005 of 006 and FR-012, SC-005 of 007: the incremental index, refs and edges included, are what
+    a full rebuild of the same tree stores."""
+    before, graph_before = content(conn, name), relations(conn, name)
     assert ingest.ingest(conn, name, ENV, full=True).mode == "full"
-    assert content(conn, name) == before
+    assert content(conn, name) == before and relations(conn, name) == graph_before
 
 
 def test_ingest_summary_and_rows(conn, repo, caplog):
@@ -436,3 +459,107 @@ def test_edited_file_keeps_its_unchanged_symbols(conn, repo):
     assert (now["Service"], now["Service.run"]) == (ids["Service"], ids["Service.run"])
     assert now["helper"] != ids["helper"]
     assert_matches_full(conn, name)
+
+
+# --- the code graph stays current (007 US4) ------------------------------------------------------------------
+
+LIB_PY = '''def target():
+    return 1
+'''
+USE_PY = '''from lib import target
+
+
+def caller():
+    return target()
+
+
+def other():
+    return target()
+
+
+target()
+'''
+
+
+@pytest.fixture
+def graph_repo(repo):
+    write(repo / "lib.py", LIB_PY)
+    write(repo / "use.py", USE_PY)
+    git(repo, "add", "-A")
+    git(repo, "commit", "-q", "-m", "graph")
+    return repo
+
+
+def callers_of(conn, name, symbol):
+    return {c.name for c in graph.callers(conn, symbol, [name])}
+
+
+def test_graph_follows_edits_and_deletions(conn, graph_repo):
+    name = register(conn, graph_repo)
+    ingest.ingest(conn, name, ENV)
+    assert callers_of(conn, name, "target") == {"caller", "other", "(module)"}
+    assert callers_of(conn, name, "helper") == {"Service.run"}
+
+    write(graph_repo / "lib.py", LIB_PY.replace("return 1", "return 2"))  # the callee gets a new id
+    git(graph_repo, "commit", "-q", "-am", "edit callee")
+    s = ingest.ingest(conn, name, ENV)
+    assert (s.mode, s.changed) == ("incremental", 1)
+    assert callers_of(conn, name, "target") == {"caller", "other", "(module)"}  # US4 scenario 2: use.py not re-read
+
+    write(graph_repo / "use.py", USE_PY.replace("def other():\n    return target()\n\n\n", ""))
+    git(graph_repo, "commit", "-q", "-am", "drop a caller")
+    ingest.ingest(conn, name, ENV)
+    assert callers_of(conn, name, "target") == {"caller", "(module)"}  # US4 scenario 1
+    assert any("'use.py', 'lib.py'" in row for row in relations(conn, name)["imports"])
+    assert_matches_full(conn, name)
+
+
+def forget_graph(conn, name):
+    """What an index written before step 7 looks like: no refs, no edges, no extract version."""
+    with conn.cursor() as cur:
+        rid = cur.execute("select id from ccctx_repos where name = :n", n=name).fetchone()[0]
+        in_repo = "(select id from ccctx_files where repo_id = :r)"
+        for sql in (f"delete from ccctx_call_refs where file_id in {in_repo}",
+                    f"delete from ccctx_import_refs where file_id in {in_repo}",
+                    f"delete from ccctx_file_calls where file_id in {in_repo}",
+                    f"delete from ccctx_imports where importer_id in {in_repo}",
+                    f"delete from ccctx_calls where caller_id in (select id from ccctx_symbols where file_id in {in_repo})"):
+            cur.execute(sql, r=rid)
+        cur.execute("update ccctx_repos set extract_version = null where id = :r", r=rid)
+    conn.commit()
+
+
+def extract_version(conn, name):
+    with conn.cursor() as cur:
+        return cur.execute("select extract_version from ccctx_repos where name = :n", n=name).fetchone()[0]
+
+
+def test_repository_indexed_before_the_graph_is_reread_without_reembedding(conn, graph_repo):
+    name = register(conn, graph_repo)
+    first = ingest.ingest(conn, name, ENV)
+    full_graph = relations(conn, name)
+    ids = {path: named_ids(conn, name, path) for path in ("app.py", "lib.py", "use.py")}
+    forget_graph(conn, name)
+    assert callers_of(conn, name, "target") == set()
+
+    s = ingest.ingest(conn, name, ENV)  # FR-013: same revision, yet every file is re-read for its refs
+    assert s.mode == "incremental" and (s.changed, s.files) == (first.files, first.files)
+    assert s.symbols == 0  # no symbol changed, so nothing is re-embedded
+    assert {path: named_ids(conn, name, path) for path in ids} == ids
+    assert extract_version(conn, name) == ingest.EXTRACT_VERSION
+    assert relations(conn, name) == full_graph
+    assert ingest.ingest(conn, name, ENV).mode == "current"
+
+
+def test_failed_reread_keeps_the_old_extract_version(conn, graph_repo, monkeypatch):
+    name = register(conn, graph_repo)
+    ingest.ingest(conn, name, ENV)
+    forget_graph(conn, name)
+
+    def boom(cur, repo_id):
+        raise RuntimeError("database went away")
+
+    monkeypatch.setattr(graph, "rebuild", boom)
+    with pytest.raises(RuntimeError):
+        ingest.ingest(conn, name, ENV)
+    assert extract_version(conn, name) is None and relations(conn, name)["call refs"] == []

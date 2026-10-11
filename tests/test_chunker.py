@@ -4,7 +4,7 @@ from pathlib import Path
 
 import pytest
 
-from golestan_code_mcp.chunker import chunk, detect_language, windows
+from golestan_code_mcp.chunker import chunk, detect_language, parse, windows
 
 FIXTURES = Path(__file__).parent / "fixtures"
 
@@ -115,3 +115,112 @@ def test_empty_text_has_no_windows():
 )
 def test_detect_language(path, language):
     assert detect_language(path) == language
+
+
+PY_SOURCE = """\
+import a.b
+from a.b import c
+from . import x
+from ..m import y as z
+from q import *
+
+def helper():
+    return 1
+
+
+@register("k")
+def handler():
+    # helper() in a comment
+    \"\"\"helper() in a docstring\"\"\"
+    s = "helper() in a string"
+    def inner():
+        return a.b.join("p")
+    return helper()
+
+
+class Box:
+    size = compute()
+
+    def grow(self):
+        self.shrink()
+        f = lambda: tally()
+"""
+
+
+def refs(language: str, text: str) -> tuple[set[tuple], set[tuple]]:
+    _, calls, imports = parse(language, text)
+    return {tuple(c) for c in calls}, {tuple(i) for i in imports}
+
+
+def test_python_calls():
+    calls, _ = refs("python", PY_SOURCE)
+    assert calls == {
+        (None, "register", "bare", None, 11),
+        ("handler", "join", "attr", "a.b", 17),
+        ("handler", "helper", "bare", None, 18),
+        ("Box", "compute", "bare", None, 22),
+        ("Box.grow", "shrink", "attr", "self", 25),
+        ("Box.grow", "tally", "bare", None, 26),
+    }
+
+
+def test_python_imports():
+    _, imports = refs("python", PY_SOURCE)
+    assert imports == {("a.b", 0, "a"), ("a.b.c", 0, "c"), ("x", 1, "x"), ("m.y", 2, "z"), ("q", 0, None)}
+
+
+def test_parse_chunks_match_chunk():
+    assert parse("python", PY_SOURCE)[0] == chunk("python", PY_SOURCE)
+
+
+GO_SOURCE = """\
+package main
+
+import (
+	"fmt"
+	"net/http"
+	str "strings"
+)
+
+func Run() {
+	Greet()
+	fmt.Println(str.ToUpper("a"), http.StatusOK)
+}
+"""
+
+
+def test_go_calls_and_imports():
+    calls, imports = refs("go", GO_SOURCE)
+    assert calls == {
+        ("Run", "Greet", "bare", None, 10),
+        ("Run", "Println", "attr", "fmt", 11),
+        ("Run", "ToUpper", "attr", "str", 11),
+    }
+    assert imports == {("fmt", 0, "fmt"), ("net/http", 0, "http"), ("strings", 0, "str")}
+
+
+JS_SOURCE = """\
+import { join } from "./paths";
+import React from "react";
+const util = require("./util");
+
+function main() {
+  helper();
+  util.format("a");
+  return new Widget();
+}
+"""
+
+
+def test_javascript_calls_and_imports():
+    calls, imports = refs("javascript", JS_SOURCE)
+    assert {c for c in calls if c[0] == "main"} == {
+        ("main", "helper", "bare", None, 6),
+        ("main", "format", "attr", "util", 7),
+        ("main", "Widget", "bare", None, 8),
+    }
+    assert imports == {("./paths", 0, "join"), ("./util", 0, "util")}
+
+
+def test_syntax_error_yields_no_calls_or_imports():
+    assert parse("python", (FIXTURES / "broken.py").read_text(encoding="utf-8")) is None

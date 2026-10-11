@@ -9,6 +9,12 @@ import oracledb
 
 ALREADY_EXISTS = {"ORA-00955", "ORA-02260", "ORA-02261", "ORA-01408", "ORA-01430", "ORA-02264"}
 
+# What the hybrid index searches: kind, name and path first, then the code. Ingest writes the same shape.
+BACKFILL_SEARCH_TEXT = """update ccctx_symbols s
+   set search_text = s.kind || ' ' || s.name || ' in '
+                     || (select f.path from ccctx_files f where f.id = s.file_id) || chr(10) || s.source
+ where s.search_text is null"""
+
 TRACKING = """create table ccctx_migrations (
   version     number primary key,
   name        varchar2(128) not null,
@@ -64,14 +70,25 @@ MIGRATIONS: list[tuple[int, str, list[str]]] = [
           loaded_at   timestamp with time zone default systimestamp not null
         )""",
     ]),
+    # One hybrid vector index over search_text replaces the step 3 column and its HNSW index; it computes
+    # its own vectors. The backfill makes symbols stored earlier searchable without re-ingesting.
+    # `ccctx model load` builds the index, because it needs the model and the vector memory pool.
+    (4, "hybrid search text", [
+        ("drop index ccctx_symbols_embedding_ix", {"ORA-01418"}),  # already dropped
+        ("alter table ccctx_symbols drop column embedding", {"ORA-00904"}),  # already dropped
+        "alter table ccctx_symbols add (search_text clob)",
+        BACKFILL_SEARCH_TEXT,
+    ]),
 ]
 
 
-def _run(cur, sql: str) -> None:
+def _run(cur, statement: str | tuple[str, set[str]]) -> None:
+    """Run one migration statement. A (sql, codes) pair also tolerates those codes, for that statement only."""
+    sql, tolerated = statement if isinstance(statement, tuple) else (statement, set())
     try:
         cur.execute(sql)
     except oracledb.DatabaseError as e:
-        if getattr(e.args[0], "full_code", "") not in ALREADY_EXISTS:
+        if getattr(e.args[0], "full_code", "") not in ALREADY_EXISTS | tolerated:
             raise
 
 

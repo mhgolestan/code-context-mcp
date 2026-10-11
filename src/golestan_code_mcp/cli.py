@@ -98,13 +98,26 @@ def _model_load(conn, args) -> str:
     return semantic.load_model(conn, environment())
 
 
+def _repos(values: list[str] | None) -> list[str] | None:
+    """--repo given any number of times, each possibly comma-separated; duplicates dropped, order kept."""
+    names = [n.strip() for v in values or [] for n in v.split(",") if n.strip()]
+    return list(dict.fromkeys(names)) or None
+
+
+def _dash(rank: int | None):
+    return "-" if rank is None else rank
+
+
 def _search(conn, args) -> str:
-    results = semantic.search(conn, args.question, args.repo)
+    results = semantic.search(conn, args.question, _repos(args.repo), args.mode, environment())
     if not results:
-        return f"no symbols similar enough (similarity >= {semantic.FLOOR:.2f})"
-    rows = [(r.rank, f"{r.similarity:.3f}", r.repo, r.kind, r.name, r.path, f"{r.start_line}-{r.end_line}")
-            for r in results]
-    return format_table(("RANK", "SIMILARITY", "REPO", "KIND", "NAME", "PATH", "LINES"), rows, frozenset({0, 1}))
+        if args.mode == "vector":
+            return f"no symbols similar enough (similarity >= {semantic.FLOOR:.2f})"
+        return "no matching symbols"
+    rows = [(r.rank, f"{r.score:.2f}", _dash(r.keyword_rank), _dash(r.semantic_rank), r.repo, r.kind, r.name, r.path,
+             f"{r.start_line}-{r.end_line}") for r in results]
+    header = ("RANK", "SCORE", "KEYWORD", "SEMANTIC", "REPO", "KIND", "NAME", "PATH", "LINES")
+    return format_table(header, rows, frozenset({0, 1, 2, 3}))
 
 
 def _db_migrate(conn, args) -> str:
@@ -147,9 +160,10 @@ def parser() -> argparse.ArgumentParser:
     st.add_argument("--repo")
     st.set_defaults(run=_stats)
 
-    srch = groups.add_parser("search", help="find symbols by meaning")
+    srch = groups.add_parser("search", help="find code by name or meaning (keyword + semantic, fused)")
     srch.add_argument("question")
-    srch.add_argument("--repo")
+    srch.add_argument("--mode", default="hybrid", help="vector, text or hybrid (default)")
+    srch.add_argument("--repo", action="append", help="limit to these repositories; repeat or comma-separate")
     srch.set_defaults(run=_search)
 
     model = groups.add_parser("model", help="embedding model").add_subparsers(dest="cmd", required=True)
@@ -170,8 +184,11 @@ def main(argv: list[str] | None = None) -> int:
         if args.run is _repo_add:  # refuse bad input before touching the database
             registry.validate_name(args.name)
             registry.resolve_dir(args.path)
-        if args.run is _search and not args.question.strip():
-            raise ValueError("the question is empty")
+        if args.run is _search:  # refuse bad input before touching the database
+            if not args.question.strip():
+                raise ValueError("the question is empty")
+            if args.mode not in semantic.MODES:
+                raise ValueError(f"unknown mode '{args.mode}'; valid modes: {', '.join(semantic.MODES)}")
         conn = db.connect(load())
         with conn:
             if args.run is not _db_migrate:

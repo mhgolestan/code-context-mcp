@@ -7,7 +7,6 @@ import os
 import subprocess
 import uuid
 from collections import Counter
-from pathlib import Path
 
 import pytest
 
@@ -202,27 +201,28 @@ def test_failed_ingest_keeps_previous_index(conn, repo, monkeypatch):
     assert stored(conn, name) == before
 
 
-def test_every_symbol_gets_an_embedding(conn, repo):
+def test_every_symbol_gets_search_text(conn, repo):
     name = register(conn, repo)
     summary = ingest.ingest(conn, name, ENV)
     with conn.cursor() as cur:
         cur.execute(
-            """select count(*), count(case when s.embedding is not null then 1 end), min(vector_dimension_count(s.embedding))
+            """select s.kind, s.name, f.path, s.source, s.search_text
                  from ccctx_symbols s join ccctx_files f on f.id = s.file_id join ccctx_repos r on r.id = f.repo_id
                 where r.name = :n""",
             n=name,
         )
-        assert cur.fetchone() == (summary.symbols, summary.symbols, 384)  # SC-002
-        cur.execute(
-            """select s.name from ccctx_symbols s join ccctx_files f on f.id = s.file_id
-                 join ccctx_repos r on r.id = f.repo_id
-                where r.name = :n
-                order by vector_distance(s.embedding,
-                         vector_embedding(ALL_MINILM_L12_V2 using 'method that runs the service' as data), cosine)
-                fetch first 1 rows only""",
-            n=name,
-        )
-        assert cur.fetchone()[0] in ("Service.run", "Service")  # embedded text carries name, kind and path
+        rows = [tuple(v.read() if hasattr(v, "read") else v for v in row) for row in cur]
+    assert len(rows) == summary.symbols
+    for kind, symbol, path, source, text in rows:
+        assert text == f"{kind} {symbol} in {path}\n{source}"
+
+
+def test_ingested_symbols_are_searchable_at_once(conn, repo):
+    name = register(conn, repo)
+    ingest.ingest(conn, name, ENV)
+    # no sleep, no sync call: the hybrid index syncs on commit (FR-014)
+    assert semantic.search(conn, "helper", [name], mode="text")[0].name == "helper"
+    assert "Service.run" in [r.name for r in semantic.search(conn, "method that runs the service", [name])]
 
 
 def test_missing_model_changes_nothing(conn, repo, monkeypatch):

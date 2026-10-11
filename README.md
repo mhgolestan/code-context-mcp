@@ -82,7 +82,7 @@ Exit codes: `0` ok, `1` refused input or a missing setting, `2` the database is 
 
 ## Ingesting a codebase
 
-`ccctx ingest <name>` indexes a registered git repository as it is on disk and replaces whatever was indexed before. It needs the embedding model (see [Searching by meaning](#searching-by-meaning)) and refuses to run without it. Each run prints a summary:
+`ccctx ingest <name>` indexes a registered git repository as it is on disk and replaces whatever was indexed before. It needs the embedding model and the hybrid index (see [Searching code](#searching-code)) and refuses to run without it. Each run prints a summary:
 
 ```sh
 uv run ccctx ingest flask
@@ -95,7 +95,7 @@ Indexed 1,353 symbols in 125.4s
 Fallback  148 files as line windows (148 no grammar, 0 parse errors)
 ```
 
-Most of that time is the database embedding every symbol.
+Most of that time is the database embedding every symbol for the hybrid index when the ingest commits.
 
 How files are chosen:
 
@@ -115,11 +115,17 @@ uv run ccctx symbols --repo flask --limit 5      # parsed symbols first; --kind 
 uv run ccctx stats --by-language                 # files, symbols and fallback chunks per repo and language
 ```
 
-## Searching by meaning
+## Searching code
 
-The database embeds code itself with Oracle's prebuilt ONNX `all_MiniLM_L12_v2` model, loaded as `ALL_MINILM_L12_V2`. There is no API key and no network call at search time, and source code never leaves the database to be embedded.
+Search combines keyword matching and semantic matching, both served by one hybrid vector index in the database. The database embeds code itself with Oracle's prebuilt ONNX `all_MiniLM_L12_v2` model, loaded as `ALL_MINILM_L12_V2`. There is no API key and no network call at search time, and source code never leaves the database to be embedded.
 
-**1. Load the model once.** This downloads the 133 MB model file into `.cache/models/` (git-ignored), loads it with `DBMS_VECTOR.LOAD_ONNX_MODEL`, records its name and dimension, and builds the HNSW vector index. Running it again does nothing.
+**1. Set up the model and the index once.** This step:
+
+- downloads the 133 MB model file into `.cache/models/` (git-ignored)
+- loads it with `DBMS_VECTOR.LOAD_ONNX_MODEL` and records its name and dimension
+- builds the hybrid vector index over every symbol's kind, name, path and source
+
+Building the index takes several minutes for flask and gin together. Running the command again does nothing. If you already ran it before hybrid search existed, run it once more: that builds the new index, and the symbols you already ingested are searchable without re-ingesting.
 
 ```sh
 uv run ccctx model load
@@ -134,19 +140,46 @@ SELECT VECTOR_EMBEDDING(ALL_MINILM_L12_V2 USING 'hello world' as data) AS v;  --
 
 `CCCTX_MODEL_URL` and `CCCTX_MODEL_CACHE` change where the file comes from and where it is kept.
 
-The index lives in the database's vector memory pool. The first container start after this step sets the pool to 256 MB and restarts the database once (`db/startup/02_vector_memory.sh`). Later starts leave it alone.
+The index's vector half lives in the database's vector memory pool. The first container start after vector search was added sets the pool to 256 MB and restarts the database once (`db/startup/02_vector_memory.sh`). Later starts leave it alone. The index updates when an ingest commits, so a finished ingest is searchable at once.
 
-**2. Re-ingest** each repository, so every symbol gets an embedding. Each symbol's kind, name, path and source are embedded together.
-
-**3. Ask a question.**
+**2. Search.**
 
 ```sh
-uv run ccctx search "how are incoming requests routed to handlers"
-uv run ccctx search "recipe for sourdough bread"      # no symbols similar enough (similarity >= 0.30)
-uv run ccctx search "error handling" --repo gin
+uv run ccctx search "url_for"                                       # the definition comes first
+uv run ccctx search "url_for" --mode text                           # only symbols containing url_for
+uv run ccctx search "how are incoming requests routed to handlers"  # by meaning
+uv run ccctx search "middleware chain" --repo gin                   # one repository
+uv run ccctx search "routing" --repo flask,gin                      # or several (also: --repo flask --repo gin)
 ```
 
-Search returns the 10 symbols closest by cosine distance, through the approximate HNSW index, and drops any below a similarity of 0.3. A weak match is worse than none when the results feed a language model. Each row shows its rank, similarity, repository, kind, name, path and lines.
+```text
+RANK  SCORE  KEYWORD  SEMANTIC  REPO   KIND      NAME           PATH                     LINES
+   1  24.38        5         4  flask  method    Flask.url_for  src/flask/app.py         1102-1222
+   2  21.82        6         7  flask  function  url_for        src/flask/helpers.py     200-251
+   4  29.69        1        11  flask  class     TestUrlFor     tests/test_helpers.py    94-161
+```
+
+Modes, chosen with `--mode`:
+
+- **`hybrid`** (default): keyword and semantic results fused with reciprocal rank fusion (`DBMS_HYBRID_VECTOR.SEARCH` with `RRF` and `UNION`). A symbol that both rank highly rises to the top. The keyword side matches any word of the query, and plain words also match their stems (`routed` finds `route`).
+- **`text`**: keyword matching only. Every word of the query must appear.
+- **`vector`**: meaning only.
+
+How results are ranked:
+
+- **Definitions first**: when the query is an identifier, the symbols named exactly that, or ending in `.<identifier>` such as `Flask.url_for`, come before everything else in `hybrid` and `text` mode. Matching ignores case.
+- **Similarity floor**: a result found only by meaning must have a cosine similarity of at least 0.3, so an unrelated question returns nothing rather than ten weak matches. Keyword matches always count.
+- **One window per file**: of a file's fallback line windows, only the best one is shown.
+- **At most 10 results.** Query text is always taken literally: `_`, `-`, `&`, quotes and parentheses are never search operators.
+- **Why each result ranked**: `SCORE` is the fused score (or the single side's score in `text` and `vector` mode). `KEYWORD` and `SEMANTIC` are its rank on each side among the repositories searched, with `-` when that side did not find it.
+
+Fusion settings:
+
+| Setting | Default | Meaning |
+|---|---|---|
+| `CCCTX_TEXT_WEIGHT` | `1` | Weight of the keyword side in the fusion |
+| `CCCTX_VECTOR_WEIGHT` | `1` | Weight of the semantic side in the fusion |
+| `CCCTX_SEARCH_CANDIDATES` | `100` | Rows asked of the index before scoping and the cap of 10; widened automatically, up to 4000, when `--repo` filters most of them out |
 
 ## Checking that data persists
 
@@ -167,7 +200,7 @@ The server talks MCP over standard input and output. It has three tools:
 
 - `health` returns the server name, version and whether the database is reachable.
 - `list_repositories` returns the registered repositories with their paths and file and symbol counts, the same as `ccctx repo list`.
-- `search` takes a `question` and an optional `repo`, and returns the same results as `ccctx search`, with `status` `ok` or `unavailable`.
+- `search` takes a `question`, an optional `mode` (`hybrid`, `text` or `vector`) and optional `repos` (or a single `repo`), and returns the same results as `ccctx search`: `status` `ok` or `unavailable`, and each result's `score`, `keyword_rank`, `semantic_rank` and `similarity`.
 
 A stopped database gives `"database": "unreachable"` with a reason, not an error.
 
@@ -214,7 +247,7 @@ src/golestan_code_mcp/    config, db check, sample cloner, MCP server
   registry.py             register and list repositories (shared by CLI and MCP)
   chunker.py              tree-sitter chunks for Python, Go, JavaScript; line-window fallback
   ingest.py               list files with read-only git, skip rules, store one repository's index
-  semantic.py             embedding model setup, model check, semantic search
+  semantic.py             model and hybrid index setup, hybrid / text / vector search
   cli.py                  the ccctx command
 tests/                    pytest suite and chunker fixtures
 ```

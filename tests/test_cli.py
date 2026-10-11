@@ -209,22 +209,59 @@ def test_model_load_when_present(model, capsys):
     assert code == 0 and out.strip() == "model ALL_MINILM_L12_V2 already present (384 dimensions)"
 
 
+HEADER = ["RANK", "SCORE", "KEYWORD", "SEMANTIC", "REPO", "KIND", "NAME", "PATH", "LINES"]
+
+
+def table(out):
+    header, *rows = out.splitlines()
+    assert header.split() == HEADER
+    return [r.split() for r in rows]
+
+
 def test_search_prints_ranked_table(ingested, capsys):
     n, _ = ingested
-    code, out, _ = run(capsys, "search", "a method on class B", "--repo", n)
-    header, *rows = out.splitlines()
-    assert code == 0 and header.split() == ["RANK", "SIMILARITY", "REPO", "KIND", "NAME", "PATH", "LINES"]
-    assert rows and rows[0].split()[0] == "1"
-    sims = [float(r.split()[1]) for r in rows]
-    assert sims == sorted(sims, reverse=True) and all(s >= 0.3 for s in sims)
-    assert all(len(r.split()[1].split(".")[1]) == 3 for r in rows)  # three decimals
+    code, out, _ = run(capsys, "search", "a", "--repo", n)
+    rows = table(out)
+    assert code == 0 and rows[0][:1] == ["1"] and rows[0][6] == "a"  # the definition of `a` comes first
+    assert all(len(r[1].split(".")[1]) == 2 for r in rows)  # score with two decimals
+    assert all(r[2] == "-" or r[2].isdigit() for r in rows) and all(r[3] == "-" or r[3].isdigit() for r in rows)
 
 
-def test_search_nothing_similar_enough(ingested, capsys, monkeypatch):
+@pytest.mark.parametrize(("mode", "keyword_dash", "semantic_dash"), [("text", False, True), ("vector", True, False)])
+def test_search_modes(ingested, capsys, mode, keyword_dash, semantic_dash):
     n, _ = ingested
-    monkeypatch.setattr(semantic, "search", lambda conn, question, repo=None: [])
-    code, out, _ = run(capsys, "search", "recipe for sourdough bread", "--repo", n)
-    assert code == 0 and out.strip() == "no symbols similar enough (similarity >= 0.30)"
+    code, out, _ = run(capsys, "search", "class", "--repo", n, "--mode", mode)
+    rows = table(out)
+    assert code == 0 and rows
+    assert all((r[2] == "-") == keyword_dash and (r[3] == "-") == semantic_dash for r in rows)
+
+
+def test_search_unknown_mode_refused_before_connecting(capsys, monkeypatch):
+    monkeypatch.setenv("DB_PORT", "1")
+    code, out, err = run(capsys, "search", "url_for", "--mode", "bogus")
+    assert code == 1 and out == "" and "valid modes: vector, text, hybrid" in err
+
+
+def test_search_repo_flags_narrow(ingested, capsys, monkeypatch):
+    n, _ = ingested
+    seen = []
+    monkeypatch.setattr(semantic, "search", lambda conn, question, repos=None, mode="hybrid", env=None:
+                        seen.append((repos, mode)) or [])
+    run(capsys, "search", "x", "--repo", n, "--repo", f"{n},gin", "--repo", n)
+    run(capsys, "search", "x")
+    assert seen == [([n, "gin"], "hybrid"), (None, "hybrid")]
+
+
+@pytest.mark.parametrize(("mode", "message"), [
+    ("vector", "no symbols similar enough (similarity >= 0.30)"),
+    ("hybrid", "no matching symbols"),
+    ("text", "no matching symbols"),
+])
+def test_search_empty_results(ingested, capsys, monkeypatch, mode, message):
+    n, _ = ingested
+    monkeypatch.setattr(semantic, "search", lambda *args, **kwargs: [])
+    code, out, _ = run(capsys, "search", "recipe for sourdough bread", "--repo", n, "--mode", mode)
+    assert code == 0 and out.strip() == message
 
 
 @pytest.mark.parametrize("question", ["", "   "])
@@ -240,7 +277,7 @@ def test_search_unknown_repo(model, capsys):
 
 
 def test_search_missing_model_hint(live, capsys, monkeypatch):
-    monkeypatch.setattr(semantic, "MODEL", "NOT_A_MODEL")
+    monkeypatch.setattr(semantic, "INDEX", "NOT_AN_INDEX")
     code, _, err = run(capsys, "search", "routing")
     assert code == 1 and "ccctx model load" in err
 

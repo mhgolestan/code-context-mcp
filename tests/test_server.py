@@ -1,6 +1,8 @@
 """health tool contract (contracts/health-tool.md), driven through an in-memory MCP client."""
 
 import asyncio
+import json
+import logging
 import time
 
 import pytest
@@ -33,7 +35,7 @@ def test_lists_three_tools():
     assert tools["health"].inputSchema.get("properties", {}) == {}
     assert tools["list_repositories"].inputSchema.get("properties", {}) == {}
     schema_ = tools["search"].inputSchema
-    assert set(schema_["properties"]) == {"question", "repo"} and schema_["required"] == ["question"]
+    assert set(schema_["properties"]) == {"question", "repo", "repos", "mode"} and schema_["required"] == ["question"]
 
 
 def test_reachable_when_database_up():
@@ -90,20 +92,41 @@ def test_list_repositories_unreachable_is_a_result(monkeypatch):
     assert "Not-A-Real-Pw-42" not in result["reason"]
 
 
-def test_search_matches_core():
+def ready():
     try:
         conn = db.connect(load())
         semantic.require_model(conn)
     except Exception:
-        pytest.skip("database unreachable or embedding model not loaded")
-    question = "how are incoming requests routed to handlers"
-    with conn:
-        expected = [vars(r) for r in semantic.search(conn, question)]
-    result = call("search", question=question)
+        pytest.skip("database unreachable or hybrid index not built")
+    return conn
+
+
+@pytest.mark.parametrize("arguments", [
+    {"question": "how are incoming requests routed to handlers"},
+    {"question": "url_for", "mode": "hybrid"},
+    {"question": "url_for", "mode": "text", "repos": ["flask"]},
+    {"question": "middleware chain", "repo": "gin"},  # the single repo input still works
+    {"question": "middleware chain", "repo": "gin", "repos": ["gin"]},
+])
+def test_search_matches_core(arguments):
+    conn = ready()
+    names = list(dict.fromkeys((arguments.get("repos") or []) + ([arguments["repo"]] if "repo" in arguments else [])))
+    try:
+        with conn:
+            expected = [vars(r) for r in semantic.search(conn, arguments["question"], names or None,
+                                                         arguments.get("mode", "hybrid"))]
+    except Exception as e:  # repositories not registered in this database
+        pytest.skip(f"sample repositories not indexed: {e}")
+    result = call("search", **arguments)
     assert result == {"status": "ok", "reason": None, "results": expected}  # SC-008
 
 
-@pytest.mark.parametrize("arguments", [{"question": "  "}, {"question": "routing", "repo": "t-missing"}])
+@pytest.mark.parametrize("arguments", [
+    {"question": "  "},
+    {"question": "routing", "repo": "t-missing"},
+    {"question": "routing", "repos": ["t-missing"]},
+    {"question": "routing", "mode": "bogus"},
+])
 def test_search_refusals_are_results(arguments):
     try:
         db.connect(load()).close()
@@ -111,6 +134,22 @@ def test_search_refusals_are_results(arguments):
         pytest.skip("database unreachable")
     result = call("search", **arguments)
     assert result["status"] == "unavailable" and result["reason"] and result["results"] == []
+
+
+def test_each_tool_call_is_logged(monkeypatch, caplog):
+    monkeypatch.setenv("DB_PORT", "1")
+    caplog.set_level(logging.INFO, logger="golestan_code_mcp.server")
+    call("health")
+    call("list_repositories")
+    call("search", question="secret_marker_question")
+    records = [json.loads(r.getMessage()) for r in caplog.records if r.name == "golestan_code_mcp.server"]
+    assert [(r["event"], r["tool"], r["status"], r["results"]) for r in records] == [
+        ("tool", "health", "unreachable", None),
+        ("tool", "list_repositories", "unreachable", 0),
+        ("tool", "search", "unavailable", 0),
+    ]
+    assert all(isinstance(r["ms"], int) for r in records)
+    assert "secret_marker_question" not in caplog.text  # never the question or source text
 
 
 def test_search_unreachable_is_a_result(monkeypatch):

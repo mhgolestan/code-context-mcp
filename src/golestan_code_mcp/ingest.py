@@ -22,7 +22,6 @@ from golestan_code_mcp.config import environment, max_file_bytes, vendor_dirs
 from golestan_code_mcp.registry import get_repo
 
 log = logging.getLogger("golestan_code_mcp.ingest")
-EMBED_CHARS = 4000  # more than the model reads; keeps the bind a VARCHAR2
 
 GIT_SAFE = ["-c", "core.fsmonitor=false", "-c", f"core.hooksPath={os.devnull}", "--no-optional-locks"]
 
@@ -91,18 +90,17 @@ def _sha(text: str) -> str:
 
 
 def _insert_symbols(cur, rows: list[dict]) -> None:
-    """The database embeds each symbol as it is inserted: kind, name and path first, so truncation keeps them."""
+    """Store each symbol with its searchable text; the hybrid index vectorizes it when the ingest commits."""
     if not rows:
         return
-    cur.setinputsizes(source=oracledb.DB_TYPE_CLOB)
-    # :source (a LOB) must be the last bind, or long sources fail with ORA-24816. The model reads only its
-    # first few hundred tokens, so the text it embeds is capped at EMBED_CHARS and bound as a plain string.
+    cur.setinputsizes(search_text=oracledb.DB_TYPE_CLOB, source=oracledb.DB_TYPE_CLOB)
+    # The two LOB binds must come last, or long sources fail with ORA-24816.
     cur.executemany(
-        "insert into ccctx_symbols (file_id, name, kind, start_line, end_line, content_hash, commit_sha, embedding,"
-        " source) values (:file_id, :name, :kind, :start_line, :end_line, :content_hash, :commit_sha,"
-        f" vector_embedding({semantic.MODEL} using :text as data), :source)",
+        "insert into ccctx_symbols (file_id, name, kind, start_line, end_line, content_hash, commit_sha,"
+        " search_text, source) values (:file_id, :name, :kind, :start_line, :end_line, :content_hash,"
+        " :commit_sha, :search_text, :source)",
         [{k: v for k, v in row.items() if k != "path"}
-         | {"text": f"{row['kind']} {row['name']} in {row['path']}\n{row['source']}"[:EMBED_CHARS]} for row in rows],
+         | {"search_text": f"{row['kind']} {row['name']} in {row['path']}\n{row['source']}"} for row in rows],
     )
 
 

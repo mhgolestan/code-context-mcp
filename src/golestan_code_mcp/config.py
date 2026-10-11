@@ -54,6 +54,35 @@ def model_cache(env: Mapping[str, str]) -> Path:
     return (path if path.is_absolute() else PROJECT_ROOT / path).resolve()
 
 
+def search_candidates(env: Mapping[str, str]) -> int:
+    """Rows asked of the hybrid index before repository filtering, the definition boost and the cap."""
+    text = (env.get("CCCTX_SEARCH_CANDIDATES") or "").strip() or "100"
+    if not text.isdigit() or int(text) < 1:
+        raise ConfigError(f"invalid setting: CCCTX_SEARCH_CANDIDATES={text!r} (expected a positive integer)")
+    return int(text)
+
+
+def _weight(env: Mapping[str, str], name: str) -> float:
+    text = (env.get(name) or "").strip() or "1"
+    try:
+        value = float(text)
+    except ValueError:
+        value = 0.0
+    if not value > 0:
+        raise ConfigError(f"invalid setting: {name}={text!r} (expected a positive number)")
+    return value
+
+
+def text_weight(env: Mapping[str, str]) -> float:
+    """Keyword side's weight in the fusion."""
+    return _weight(env, "CCCTX_TEXT_WEIGHT")
+
+
+def vector_weight(env: Mapping[str, str]) -> float:
+    """Semantic side's weight in the fusion."""
+    return _weight(env, "CCCTX_VECTOR_WEIGHT")
+
+
 def max_file_bytes(env: Mapping[str, str]) -> int:
     text = (env.get("CCCTX_MAX_FILE_BYTES") or "").strip() or "1048576"
     if not text.isdigit() or int(text) < 1:

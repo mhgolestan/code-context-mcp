@@ -8,6 +8,9 @@ from golestan_code_mcp.config import (
     max_file_bytes,
     model_cache,
     model_url,
+    search_candidates,
+    text_weight,
+    vector_weight,
     repos_dir,
     vendor_dirs,
 )
@@ -75,3 +78,21 @@ def test_ingest_limits_defaults_and_overrides():
 def test_bad_max_file_bytes_named(bad):
     with pytest.raises(ConfigError, match="CCCTX_MAX_FILE_BYTES"):
         max_file_bytes({"CCCTX_MAX_FILE_BYTES": bad})
+
+
+def test_search_settings_defaults_and_overrides():
+    assert (search_candidates({}), text_weight({}), vector_weight({})) == (100, 1.0, 1.0)
+    env = {"CCCTX_SEARCH_CANDIDATES": "250", "CCCTX_TEXT_WEIGHT": "2.5", "CCCTX_VECTOR_WEIGHT": " 0.5 "}
+    assert (search_candidates(env), text_weight(env), vector_weight(env)) == (250, 2.5, 0.5)
+
+
+@pytest.mark.parametrize(("accessor", "name", "bad"), [
+    (search_candidates, "CCCTX_SEARCH_CANDIDATES", "0"),
+    (search_candidates, "CCCTX_SEARCH_CANDIDATES", "many"),
+    (text_weight, "CCCTX_TEXT_WEIGHT", "-1"),
+    (vector_weight, "CCCTX_VECTOR_WEIGHT", "heavy"),
+    (vector_weight, "CCCTX_VECTOR_WEIGHT", "nan"),
+])
+def test_bad_search_settings_named(accessor, name, bad):
+    with pytest.raises(ConfigError, match=name):
+        accessor({name: bad})

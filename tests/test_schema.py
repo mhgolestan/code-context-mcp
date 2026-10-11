@@ -71,11 +71,16 @@ def test_tables_exist_and_version_recorded(conn):
         cur.execute("select table_name from user_tables")
         assert TABLES <= {row[0] for row in cur}
         cur.execute("select version, name from ccctx_migrations order by version")
-        assert cur.fetchall()[:3] == [(1, "core tables"), (2, "symbol commit"), (3, "symbol embedding")]
+        assert cur.fetchall()[:4] == [
+            (1, "core tables"), (2, "symbol commit"), (3, "symbol embedding"), (4, "hybrid search text")
+        ]
         cur.execute("select column_name, data_type, nullable from user_tab_columns where table_name = 'CCCTX_SYMBOLS'")
         columns = {name: (kind, nullable) for name, kind, nullable in cur}
         assert "COMMIT_SHA" in columns
-        assert columns["EMBEDDING"] == ("VECTOR", "Y")  # 384 x FLOAT32 is checked on real rows in test_semantic
+        assert columns["SEARCH_TEXT"] == ("CLOB", "Y")
+        assert "EMBEDDING" not in columns  # replaced by the hybrid index's own vectors
+        cur.execute("select count(*) from user_indexes where index_name = 'CCCTX_SYMBOLS_EMBEDDING_IX'")
+        assert cur.fetchone()[0] == 0
         cur.execute("select table_name from user_tables where table_name = 'CCCTX_EMBEDDING_MODEL'")
         assert cur.fetchone()
 
@@ -137,3 +142,12 @@ def test_commit_sha_rejects_bad_values(conn, repo_id, sha):
         with pytest.raises(oracledb.DatabaseError):
             add_symbol(cur, file_id, sha=sha)
     conn.rollback()
+
+
+def test_backfill_fills_search_text(conn, repo_id):
+    with conn.cursor() as cur:
+        symbol_id = add_symbol(cur, add_file(cur, repo_id, "pkg/mod.py"), "method", 3, 9)
+        cur.execute(schema.BACKFILL_SEARCH_TEXT)
+        text = cur.execute("select search_text from ccctx_symbols where id = :i", i=symbol_id).fetchone()[0].read()
+    conn.rollback()
+    assert text == "method f in pkg/mod.py\ndef f(): pass"

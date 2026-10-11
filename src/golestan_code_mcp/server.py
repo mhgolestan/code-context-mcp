@@ -5,18 +5,26 @@ import json
 import logging
 import sys
 import time
-from typing import Literal
+from typing import Annotated, Literal
 
 import oracledb
 from mcp.server.fastmcp import FastMCP
-from pydantic import BaseModel
+from mcp.types import ToolAnnotations
+from pydantic import BaseModel, ConfigDict, Field
 
-from golestan_code_mcp import __version__, db, graph, registry, schema, semantic
+from golestan_code_mcp import db, graph, registry, schema, semantic
 from golestan_code_mcp.config import ConfigError, load
 
 NAME = "golestan_code_mcp"
 mcp = FastMCP(NAME)
 log = logging.getLogger("golestan_code_mcp.server")
+READ_ONLY = ToolAnnotations(readOnlyHint=True)
+LIMIT = 200  # graph tools return at most this many rows; truncated says when more existed
+
+Name = Annotated[str, Field(description="A bare name (url_for), which matches url_for and every Class.url_for, or a "
+                            "qualified name (Flask.url_for), which matches only that definition. Case-sensitive.")]
+Repo = Annotated[str | None, Field(description="Look only in this registered repository, for example flask. "
+                                   "list_repositories gives the valid names. Default: all repositories.")]
 
 
 def _logged(tool):
@@ -37,50 +45,21 @@ def _logged(tool):
     return wrapper
 
 
-class Health(BaseModel):
-    server: str
-    version: str
-    database: Literal["reachable", "unreachable"]
-    reason: str | None
-
-
-@mcp.tool(description="Report the server name, its version, and whether the database is reachable.")
-@_logged
-def health() -> Health:
+def _answer(envelope, check, query):
+    """Refuse bad input before connecting, then answer from the core. Every failure is an unavailable result."""
     try:
-        db.connect(load()).close()
-    except ConfigError as e:
-        return Health(server=NAME, version=__version__, database="unreachable", reason=str(e))
-    except oracledb.Error as e:
-        return Health(server=NAME, version=__version__, database="unreachable", reason=db.describe(e))
-    return Health(server=NAME, version=__version__, database="reachable", reason=None)
-
-
-class RepoInfo(BaseModel):
-    name: str
-    path: str
-    files: int
-    symbols: int
-
-
-class RepoList(BaseModel):
-    database: Literal["reachable", "unreachable"]
-    reason: str | None
-    repositories: list[RepoInfo]
-
-
-@mcp.tool(description="List the registered repositories with their paths and how many files and symbols each holds.")
-@_logged
-def list_repositories() -> RepoList:
-    try:
+        check()
         with db.connect(load()) as conn:
             schema.migrate(conn)
-            repos = registry.list_repos(conn)
-    except ConfigError as e:
-        return RepoList(database="unreachable", reason=str(e), repositories=[])
+            return query(conn)
+    except ValueError as e:  # ConfigError, RegistryError and ModelError are ValueErrors
+        return envelope(status="unavailable", reason=str(e), results=[])
     except oracledb.Error as e:
-        return RepoList(database="unreachable", reason=db.describe(e), repositories=[])
-    return RepoList(database="reachable", reason=None, repositories=[RepoInfo(**vars(r)) for r in repos])
+        return envelope(status="unavailable", reason=db.describe(e), results=[])
+
+
+def _repos(repo: str | None) -> list[str] | None:
+    return [repo] if repo else None
 
 
 class SearchHit(BaseModel):
@@ -95,6 +74,8 @@ class SearchHit(BaseModel):
     path: str
     start_line: int
     end_line: int
+    language: str
+    snippet: str
 
 
 class SearchResults(BaseModel):
@@ -104,28 +85,77 @@ class SearchResults(BaseModel):
 
 
 @mcp.tool(
-    description="Search indexed code by exact name or by meaning. Returns up to 10 symbols with repository, path "
-    "and line range. mode: hybrid (default, keyword and semantic fused with reciprocal rank fusion; an "
-    "identifier's definitions come first), text (every word must appear) or vector (meaning only, similarity "
-    "0.3 or more). repos (or repo) limits the search to those repositories; all are searched by default. "
-    "Each result explains its rank: fused score, keyword rank and semantic rank (null when that side missed it)."
+    description="Find code by what it does or by name: \"how are requests routed?\", \"where are sessions saved?\", "
+    "\"url_for\". Use this first when you do not yet know which symbol to look at. If you already know the name, "
+    "use get_symbol to read it, find_callers for its call sites, or impact_of for what a change would affect. "
+    "Returns up to limit hits (default 10), best first. Each hit has the repository, path, symbol name, kind, "
+    "language, line range, a snippet of the symbol's opening lines, and the scores behind its rank: the fused "
+    "score, the keyword rank and the semantic rank (null when that side did not find it). Keyword and semantic "
+    "search are fused, and the definitions of an exact identifier come first. Next step: call get_symbol with a "
+    "hit's name to read its full source.",
+    annotations=READ_ONLY,
 )
 @_logged
-def search(question: str, repo: str | None = None, repos: list[str] | None = None,
-           mode: str = "hybrid") -> SearchResults:
-    names = list(dict.fromkeys((repos or []) + ([repo] if repo else []))) or None
-    try:
-        with db.connect(load()) as conn:
-            schema.migrate(conn)
-            hits = semantic.search(conn, question, names, mode)  # refuses an empty question, bad mode or repo
-    except ValueError as e:  # ConfigError, RegistryError and ModelError are ValueErrors
-        return SearchResults(status="unavailable", reason=str(e), results=[])
-    except oracledb.Error as e:
-        return SearchResults(status="unavailable", reason=db.describe(e), results=[])
-    return SearchResults(status="ok", reason=None, results=[SearchHit(**vars(h)) for h in hits])
+def search_code(
+    query: Annotated[str, Field(description="A question in plain English (how are requests routed) or an "
+                                "identifier (url_for). Taken literally; there is no query syntax.")],
+    repo: Annotated[str | None, Field(description="Search only this registered repository, for example flask. "
+                                      "list_repositories gives the valid names. Default: all repositories.")] = None,
+    language: Annotated[str | None, Field(description="Search only files of this language: one of "
+                                          f"{', '.join(semantic.LANGUAGES)}. Default: all languages.")] = None,
+    limit: Annotated[int, Field(description="How many hits to return, 1 to 50. Default 10.")] = 10,
+) -> SearchResults:
+    def check():
+        if not query.strip():
+            raise ValueError("the question is empty")
+        semantic.check_limit(limit)
+        semantic.check_language(language)
+
+    def query_(conn):
+        hits = semantic.search(conn, query, _repos(repo), language=language, limit=limit)
+        return SearchResults(status="ok", reason=None, results=[SearchHit(**vars(h)) for h in hits])
+
+    return _answer(SearchResults, check, query_)
 
 
-LIMIT = 200  # graph tools return at most this many rows; truncated says when more existed
+class SymbolHit(BaseModel):
+    name: str
+    kind: str
+    repo: str
+    path: str
+    start_line: int
+    end_line: int
+    source: str
+    cut: bool
+
+
+class SymbolResults(BaseModel):
+    status: Literal["ok", "unavailable"]
+    reason: str | None
+    results: list[SymbolHit]
+    total: int = 0
+    truncated: bool = False
+
+
+@mcp.tool(
+    description="Read the full source of a named definition (function, method, class, type) when you know its name, "
+    "for example from a search_code hit. Use this instead of search_code when the name is known, and instead of "
+    "opening files: it returns the source exactly as it was indexed. A bare name returns every definition with that "
+    "name, each labeled with its qualified name; pass a qualified name or a repo to narrow. Returns up to 5 matches, "
+    "each with its qualified name, kind, repository, path, line range and source. A source longer than 400 lines is "
+    "cut there and marked cut, and its full line range is still given. total is the number of matches and "
+    "truncated is true when more than 5 matched. Unparsed files indexed as line windows have no names and are not "
+    "found here; use search_code for them.",
+    annotations=READ_ONLY,
+)
+@_logged
+def get_symbol(name: Name, repo: Repo = None) -> SymbolResults:
+    def query(conn):
+        found, total = graph.definitions(conn, name, _repos(repo))
+        return SymbolResults(status="ok", reason=None, results=[SymbolHit(**vars(d)) for d in found],
+                             total=total, truncated=total > len(found))
+
+    return _answer(SymbolResults, lambda: graph.check_name(name), query)
 
 
 class CallerHit(BaseModel):
@@ -162,7 +192,7 @@ class CallerResults(BaseModel):
     status: Literal["ok", "unavailable"]
     reason: str | None
     results: list[CallerHit]
-    truncated: bool
+    truncated: bool = False
 
 
 class CalleeResults(CallerResults):
@@ -173,53 +203,106 @@ class ImpactResults(CallerResults):
     results: list[ImpactHit]
 
 
-def _graph(answer, model, query, name: str, repo: str | None, repos: list[str] | None, *args):
-    """Run one graph question with the CLI's refusals, as an envelope of at most LIMIT rows."""
-    names = list(dict.fromkeys((repos or []) + ([repo] if repo else []))) or None
-    try:
+def _graph(envelope, hit, check, rows):
+    """A graph question as an envelope of at most LIMIT rows."""
+    def query(conn):
+        found = rows(conn)
+        return envelope(status="ok", reason=None, results=[hit(**vars(r)) for r in found[:LIMIT]],
+                        truncated=len(found) > LIMIT)
+
+    return _answer(envelope, check, query)
+
+
+@mcp.tool(
+    description="Who calls this? Lists every call to the definitions matching name: the calling symbol, its kind, the "
+    "repository, path and line of the call, and which definition is called. Use it before changing a function's "
+    "signature or behavior, to see its direct call sites. For everything a change could reach through chains of "
+    "calls, use impact_of; for what this symbol itself calls, use find_callees. Calls come from the parse tree, so "
+    "comments, docstrings and strings never count. A call at module level has kind file and name (module). At most "
+    "200 rows; truncated is true when more exist. Next step: get_symbol on a caller to read it.",
+    annotations=READ_ONLY,
+)
+@_logged
+def find_callers(name: Name, repo: Repo = None) -> CallerResults:
+    return _graph(CallerResults, CallerHit, lambda: graph.check_name(name),
+                  lambda conn: graph.callers(conn, name, _repos(repo)))
+
+
+@mcp.tool(
+    description="What does this call? Lists the indexed symbols called from the body of each definition matching "
+    "name, with the line of each call and where the called symbol is defined (repository, path, line range). Use it "
+    "to follow what a function does one level down; for who calls it, use find_callers. Calls into code that is not "
+    "indexed, such as the standard library or dependencies, are not listed. At most 200 rows; truncated is true "
+    "when more exist. Next step: get_symbol on a callee to read it.",
+    annotations=READ_ONLY,
+)
+@_logged
+def find_callees(name: Name, repo: Repo = None) -> CalleeResults:
+    return _graph(CalleeResults, CalleeHit, lambda: graph.check_name(name),
+                  lambda conn: graph.calls(conn, name, _repos(repo)))
+
+
+@mcp.tool(
+    description="What could break if I change this? Lists every symbol that reaches the definitions matching name "
+    "through calls in at most depth hops, once each at its shortest distance (hops), nearest first, with the "
+    "repository, path and line range. Use it to gauge the reach of a change; for just the direct call sites and "
+    "their lines, use find_callers. At most 200 rows; truncated is true when more exist. Next step: get_symbol on "
+    "the nearest symbols to see how they use it.",
+    annotations=READ_ONLY,
+)
+@_logged
+def impact_of(
+    name: Name,
+    depth: Annotated[int, Field(description="How many call hops to follow, 1 to 5. Default 3. 1 gives only the "
+                                "direct callers.")] = 3,
+    repo: Repo = None,
+) -> ImpactResults:
+    def check():
         graph.check_name(name)
-        if query is graph.impact:
-            graph.check_depth(*args)  # both refused before connecting
+        graph.check_depth(depth)
+
+    return _graph(ImpactResults, ImpactHit, check, lambda conn: graph.impact(conn, name, depth, _repos(repo)))
+
+
+class RepoInfo(BaseModel):
+    name: str
+    path: str
+    files: int
+    symbols: int
+
+
+class RepoList(BaseModel):
+    database: Literal["reachable", "unreachable"]
+    reason: str | None
+    repositories: list[RepoInfo]
+
+
+@mcp.tool(
+    description="Which codebases can I ask about? Lists the registered repositories with their paths and how many "
+    "files and symbols each holds. Use it to learn the valid repo values for the other tools, or after a repo was "
+    "refused. A repository with 0 files is registered but not indexed yet.",
+    annotations=READ_ONLY,
+)
+@_logged
+def list_repositories() -> RepoList:
+    try:
         with db.connect(load()) as conn:
             schema.migrate(conn)
-            rows = query(conn, name, *args, names)
-    except ValueError as e:  # ConfigError and RegistryError are ValueErrors
-        return answer(status="unavailable", reason=str(e), results=[], truncated=False)
+            repos = registry.list_repos(conn)
+    except ConfigError as e:
+        return RepoList(database="unreachable", reason=str(e), repositories=[])
     except oracledb.Error as e:
-        return answer(status="unavailable", reason=db.describe(e), results=[], truncated=False)
-    return answer(status="ok", reason=None, results=[model(**vars(r)) for r in rows[:LIMIT]],
-                  truncated=len(rows) > LIMIT)
+        return RepoList(database="unreachable", reason=db.describe(e), repositories=[])
+    return RepoList(database="reachable", reason=None, repositories=[RepoInfo(**vars(r)) for r in repos])
 
 
-@mcp.tool(
-    description="List every call to the symbols matching name (bare like url_for, or qualified like Flask.url_for; "
-    "case-sensitive), with the calling symbol, repository, path and line. Calls come from the parse tree, so "
-    "comments, docstrings and strings never appear. A module-level call has kind file and name (module). "
-    "repos (or repo) limits the question to those repositories. At most 200 results; truncated says when more exist."
-)
-@_logged
-def callers(name: str, repo: str | None = None, repos: list[str] | None = None) -> CallerResults:
-    return _graph(CallerResults, CallerHit, graph.callers, name, repo, repos)
-
-
-@mcp.tool(
-    description="List the indexed symbols called from the body of each definition matching name, with the line of "
-    "each call and where the called symbol is defined. Calls into code that is not indexed are not listed. "
-    "repos (or repo) limits the question to those repositories. At most 200 results; truncated says when more exist."
-)
-@_logged
-def calls(name: str, repo: str | None = None, repos: list[str] | None = None) -> CalleeResults:
-    return _graph(CalleeResults, CalleeHit, graph.calls, name, repo, repos)
-
-
-@mcp.tool(
-    description="Blast radius: list every symbol that reaches name through calls in at most depth hops (1 to 5, "
-    "default 3), once each at its shortest distance, nearest first. repos (or repo) limits the question to those "
-    "repositories. At most 200 results; truncated says when more exist."
-)
-@_logged
-def impact(name: str, depth: int = 3, repo: str | None = None, repos: list[str] | None = None) -> ImpactResults:
-    return _graph(ImpactResults, ImpactHit, graph.impact, name, repo, repos, depth)
+# FastMCP drops arguments a tool does not declare. Refuse them instead: a stale `repos` would otherwise widen a
+# search to every repository without saying so.
+for _tool in mcp._tool_manager.list_tools():
+    _strict = type(_tool.fn_metadata.arg_model.__name__, (_tool.fn_metadata.arg_model,),
+                   {"model_config": ConfigDict(extra="forbid")})
+    _tool.fn_metadata.arg_model = _strict
+    _tool.parameters = _strict.model_json_schema(by_alias=True)
 
 
 def main() -> None:

@@ -1,7 +1,9 @@
 """ccctx command line (contracts/cli.md). Database cases skip when it is unreachable."""
 
+import asyncio
 import re
 import subprocess
+import sys
 import time
 import uuid
 from collections import Counter
@@ -9,7 +11,7 @@ from dataclasses import replace
 
 import pytest
 
-from golestan_code_mcp import cli, db, graph, ingest, registry, semantic
+from golestan_code_mcp import cli, db, graph, ingest, registry, semantic, server
 from golestan_code_mcp.config import load
 
 FAKE_PW = "Not-A-Real-Pw-42"
@@ -247,8 +249,8 @@ def test_search_unknown_mode_refused_before_connecting(capsys, monkeypatch):
 def test_search_repo_flags_narrow(ingested, capsys, monkeypatch):
     n, _ = ingested
     seen = []
-    monkeypatch.setattr(semantic, "search", lambda conn, question, repos=None, mode="hybrid", env=None:
-                        seen.append((repos, mode)) or [])
+    monkeypatch.setattr(semantic, "search", lambda conn, question, repos=None, mode="hybrid", env=None,
+                        language=None, limit=10: seen.append((repos, mode)) or [])
     run(capsys, "search", "x", "--repo", n, "--repo", f"{n},gin", "--repo", n)
     run(capsys, "search", "x")
     assert seen == [([n, "gin"], "hybrid"), (None, "hybrid")]
@@ -291,6 +293,36 @@ def test_search_unreachable_exits_2(capsys, monkeypatch):
     code, out, err = run(capsys, "search", "routing")
     assert time.monotonic() - started < 5 and code == 2 and FAKE_PW not in out + err
 
+
+
+def test_search_language_and_limit_match_core(ingested, capsys):
+    n, _ = ingested
+    code, out, _ = run(capsys, "search", "a", "--repo", n, "--language", "python", "--limit", "2")
+    with db.connect(load()) as conn:
+        expected = semantic.search(conn, "a", [n], language="python", limit=2)
+    assert code == 0 and [(r[0], r[6], r[7]) for r in table(out)] == [(str(h.rank), h.name, h.path) for h in expected]
+    assert 1 <= len(expected) <= 2
+
+
+def test_search_language_and_limit_reach_the_core(capsys, monkeypatch, live):
+    seen = []
+    monkeypatch.setattr(semantic, "search", lambda conn, question, repos=None, mode="hybrid", env=None,
+                        language=None, limit=10: seen.append((language, limit)) or [])
+    run(capsys, "search", "x", "--language", "go", "--limit", "3")
+    run(capsys, "search", "x")
+    assert seen == [("go", 3), (None, 10)]
+
+
+@pytest.mark.parametrize(("argv", "message"), [
+    (["--limit", "0"], "limit must be between 1 and 50"),
+    (["--limit", "51"], "limit must be between 1 and 50"),
+    (["--limit", "ten"], "limit must be between 1 and 50"),
+    (["--language", "cobol"], f"unknown language 'cobol'; valid languages: {', '.join(semantic.LANGUAGES)}"),
+])
+def test_search_bad_language_or_limit_refused_before_connecting(capsys, monkeypatch, argv, message):
+    monkeypatch.setenv("DB_PORT", "1")
+    code, out, err = run(capsys, "search", "routing", *argv)
+    assert code == 1 and out == "" and err.strip() == f"error: {message}"
 
 # --- incremental ingest (006) -------------------------------------------------------------------------------
 
@@ -408,3 +440,38 @@ def test_graph_empty_name_refused_before_connecting(capsys, monkeypatch, command
     monkeypatch.setenv("DB_PORT", "1")
     code, out, err = run(capsys, command, " ")
     assert code == 1 and out == "" and err.strip() == "error: the name is empty"
+
+
+
+# --- ccctx mcp (008) ----------------------------------------------------------------------------------------
+
+
+def test_mcp_starts_the_server_without_connecting(capsys, monkeypatch):
+    monkeypatch.setenv("DB_PORT", "1")  # the server reports an outage per call; starting never connects
+    started = []
+    monkeypatch.setattr(server, "main", lambda: started.append(True))
+    code, out, _ = run(capsys, "mcp")
+    assert code == 0 and started == [True] and out == ""
+
+
+def test_mcp_child_process_serves_the_tools_from_any_directory(tmp_path):
+    from mcp import ClientSession, StdioServerParameters
+    from mcp.client.stdio import stdio_client
+
+    # the default child environment carries no DB_* settings, so they must come from the project's .env
+    params = StdioServerParameters(command=sys.executable, args=["-m", "golestan_code_mcp.cli", "mcp"],
+                                   cwd=str(tmp_path))
+
+    async def session():
+        async with stdio_client(params) as (read, write), ClientSession(read, write) as client:
+            await client.initialize()  # fails if anything but protocol messages reaches stdout
+            tools = [t.name for t in (await client.list_tools()).tools]
+            return tools, (await client.call_tool("list_repositories", {})).structuredContent
+
+    tools, repos = asyncio.run(session())
+    assert tools == ["search_code", "get_symbol", "find_callers", "find_callees", "impact_of", "list_repositories"]
+    try:
+        db.connect(load()).close()
+    except Exception:
+        return  # without a database the listing above is the whole check
+    assert repos["database"] == "reachable", repos["reason"]

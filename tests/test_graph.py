@@ -330,3 +330,109 @@ def test_repos_limit_every_question(conn, repos):
     assert graph.calls(conn, "a", repos=[py]) == []
     assert rows(graph.impact(conn, "helper", 3, repos=[go]), "hops", "name") == [(1, "start"), (1, "a")]
     assert rows(graph.callers(conn, "Helper", repos=repos), "repo", "name") == [(go, "main"), (go, "Other")]
+
+
+# --- definitions (008 T004) ---------------------------------------------------------------------------------
+
+DEFS = {
+    "pkg/a.py": '''class A:
+    def run(self):
+        return 1
+
+
+class B:
+    def run(self):
+        return 2
+
+
+def run():
+    return 3
+''',
+    "pkg/b.py": '''def run():
+    return 4
+
+
+class C:
+    def run(self):
+        return 5
+''',
+    "pkg/c.py": '''def run():
+    return 6
+''',
+    "pkg/big.py": "def big():\n" + "    x = 1\n" * 449,  # a 450-line definition
+    "notes.md": "# notes\n\nline windows only\n",
+}
+
+
+@pytest.fixture(scope="module")
+def defs(conn, tmp_path_factory):
+    name = f"t-{uuid.uuid4().hex[:8]}"
+    registry.add_repo(conn, make(tmp_path_factory.mktemp("d"), DEFS), name)
+    ingest.ingest(conn, name, {})  # the default file size limit, so big.py is indexed
+    return name
+
+
+def test_definitions_qualified_name_returns_that_definition_with_its_source(conn, repos):
+    found, total = graph.definitions(conn, "Flask.url_for", repos=repos)
+    assert total == 1
+    assert rows(found, "name", "kind", "repo", "path", "start_line", "end_line", "cut") == [
+        ("Flask.url_for", "method", repos[0], APP, 5, 6, False)]
+    assert found[0].source == "    def url_for(self, x):\n        return helpers.url_for(x)"
+
+
+def test_definitions_bare_name_returns_the_function_and_the_methods(conn, repos):
+    found, total = graph.definitions(conn, "url_for", repos=repos)
+    assert total == 3
+    assert rows(found, "name", "kind", "path", "start_line") == [
+        ("Flask.url_for", "method", APP, 5),
+        ("url_for", "function", H, 4),
+        ("Other.url_for", "method", OTHER, 2),
+    ]
+    assert found[1].source == "def url_for(x):\n    return encode(x)"
+
+
+def test_definitions_repos_limit_the_matches(conn, repos, defs):
+    py, go = repos
+    assert rows(graph.definitions(conn, "a", repos=[go])[0], "repo", "path") == [(go, "web/lib.js")]
+    assert rows(graph.definitions(conn, "a", repos=[py])[0], "path") == [(CHAIN,), (OTHER,)]
+    with pytest.raises(ValueError, match="no symbol named 'helper'"):  # only in the other repository
+        graph.definitions(conn, "helper", repos=[py])
+    with pytest.raises(registry.RegistryError, match="no repository named 't-missing'"):  # refused before the name
+        graph.definitions(conn, "nope", repos=["t-missing"])
+
+
+def test_definitions_cap_at_five_in_repo_path_line_order(conn, repos, defs):
+    py = repos[0]
+    every = sorted([
+        (defs, "pkg/a.py", 2, "A.run"), (defs, "pkg/a.py", 7, "B.run"), (defs, "pkg/a.py", 11, "run"),
+        (defs, "pkg/b.py", 1, "run"), (defs, "pkg/b.py", 6, "C.run"), (defs, "pkg/c.py", 1, "run"),
+        (py, OTHER, 5, "Other.run"),
+    ])
+    found, total = graph.definitions(conn, "run", repos=[py, defs])
+    assert total == 7
+    assert rows(found, "repo", "path", "start_line", "name") == every[:5]
+    assert graph.definitions(conn, "run", repos=[defs])[1] == 6
+
+
+def test_definitions_cut_a_long_source_at_400_lines(conn, defs):
+    found, total = graph.definitions(conn, "big", repos=[defs])
+    assert total == 1
+    (big,) = found
+    assert (big.start_line, big.end_line, big.cut) == (1, 450, True)
+    assert big.source == "\n".join(DEFS["pkg/big.py"].splitlines()[:400])
+    assert graph.definitions(conn, "C.run", repos=[defs])[0][0].cut is False
+
+
+def test_definitions_refusals(conn, repos, defs):
+    with conn.cursor() as cur:
+        cur.execute("""select s.name from ccctx_symbols s join ccctx_files f on f.id = s.file_id
+                         join ccctx_repos r on r.id = f.repo_id where r.name = :n and s.kind = 'chunk'""", n=defs)
+        (window,) = [n for (n,) in cur]  # notes.md:1-3
+    for name in (window, window.rsplit(".", 1)[1]):  # line windows never match, exactly or as a bare suffix
+        with pytest.raises(ValueError, match="no symbol named"):
+            graph.definitions(conn, name, repos=[defs])
+    with pytest.raises(ValueError, match="no symbol named 'nope'"):
+        graph.definitions(conn, "nope", repos=repos)
+    for empty in ("", "   "):
+        with pytest.raises(ValueError, match="the name is empty"):
+            graph.definitions(conn, empty, repos=repos)

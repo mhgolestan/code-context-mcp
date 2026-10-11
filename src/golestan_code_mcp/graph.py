@@ -186,6 +186,21 @@ class Impact:
     end_line: int
 
 
+@dataclass(frozen=True)
+class Definition:
+    name: str  # the qualified name
+    kind: str
+    repo: str
+    path: str
+    start_line: int
+    end_line: int  # the full definition's, even when source is cut
+    source: str  # the stored source, at most its first MAX_SOURCE_LINES lines
+    cut: bool  # true when the stored source had more lines
+
+
+MAX_DEFINITIONS = 5
+MAX_SOURCE_LINES = 400
+
 JOIN = ("join ccctx_symbols s on s.id = g.{} join ccctx_files f on f.id = s.file_id"
         " join ccctx_repos r on r.id = f.repo_id")
 
@@ -229,6 +244,31 @@ def _match(cur, sql: str, ids: list[int]) -> list[tuple]:
         cur.execute(sql.replace("{ids}", ", ".join(f":{n + 1}" for n in range(len(chunk)))), chunk)
         rows += cur.fetchall()
     return rows
+
+
+def definitions(conn, name: str, repos: list[str] | None = None) -> tuple[list[Definition], int]:
+    """The first MAX_DEFINITIONS definitions matching the name, by repository, path, then start line, with their
+    stored source cut at MAX_SOURCE_LINES lines, and the number of matches."""
+    name = check_name(name)
+    with conn.cursor() as cur:
+        targets, _ = _targets(conn, cur, name, repos)
+        found = _match(cur, """select s.id, r.name, f.path, s.start_line from ccctx_symbols s
+              join ccctx_files f on f.id = s.file_id join ccctx_repos r on r.id = f.repo_id
+             where s.id in ({ids})""", list(targets))
+        first = sorted(found, key=lambda row: (row[1], row[2], row[3], targets[row[0]]))[:MAX_DEFINITIONS]
+        rows = _match(cur, """select s.id, s.kind, r.name, f.path, s.start_line, s.end_line, s.source
+              from ccctx_symbols s join ccctx_files f on f.id = s.file_id join ccctx_repos r on r.id = f.repo_id
+             where s.id in ({ids})""", [row[0] for row in first])
+        by_id = {sid: (kind, repo, path, start, end, source.read() if hasattr(source, "read") else source or "")
+                 for sid, kind, repo, path, start, end, source in rows}  # read each CLOB while the cursor is open
+    result = []
+    for sid, *_ in first:
+        kind, repo, path, start, end, source = by_id[sid]
+        lines = source.split("\n")
+        cut = len(lines) - (lines[-1] == "") > MAX_SOURCE_LINES  # a trailing newline ends a line, not starts one
+        result.append(Definition(targets[sid], kind, repo, path, start, end,
+                                 "\n".join(lines[:MAX_SOURCE_LINES]) if cut else source, cut))
+    return result, len(targets)
 
 
 def callers(conn, name: str, repos: list[str] | None = None) -> list[Caller]:

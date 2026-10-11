@@ -132,7 +132,8 @@ def _dash(rank: int | None):
 
 
 def _search(conn, args) -> str:
-    results = semantic.search(conn, args.question, _repos(args.repo), args.mode, environment())
+    results = semantic.search(conn, args.question, _repos(args.repo), args.mode, environment(), args.language,
+                              args.limit)
     if not results:
         if args.mode == "vector":
             return f"no symbols similar enough (similarity >= {semantic.FLOOR:.2f})"
@@ -215,6 +216,8 @@ def parser() -> argparse.ArgumentParser:
     srch.add_argument("question")
     srch.add_argument("--mode", default="hybrid", help="vector, text or hybrid (default)")
     srch.add_argument("--repo", action="append", help="limit to these repositories; repeat or comma-separate")
+    srch.add_argument("--language", help="limit to files of this language")
+    srch.add_argument("--limit", default="10", help=f"hits to return, 1 to {semantic.MAX_LIMIT} (default 10)")
     srch.set_defaults(run=_search)
 
     for run, cmd, text in [(_callers, "callers", "list every call to a symbol"),
@@ -230,6 +233,8 @@ def parser() -> argparse.ArgumentParser:
     model = groups.add_parser("model", help="embedding model").add_subparsers(dest="cmd", required=True)
     model.add_parser("load", help="download once and load the embedding model").set_defaults(run=_model_load)
 
+    groups.add_parser("mcp", help="run the MCP server over standard input and output").set_defaults(run=None)
+
     dbp = groups.add_parser("db", help="database administration").add_subparsers(dest="cmd", required=True)
     dbp.add_parser("migrate", help="apply missing schema migrations").set_defaults(run=_db_migrate)
     return p
@@ -237,6 +242,11 @@ def parser() -> argparse.ArgumentParser:
 
 def main(argv: list[str] | None = None) -> int:
     args = parser().parse_args(argv)
+    if args.group == "mcp":  # before connecting: the server reports an outage per call
+        from golestan_code_mcp import server  # only this command needs the MCP library
+
+        server.main()
+        return 0
     handler = logging.StreamHandler(sys.stderr)  # the structured ingest record goes to stderr
     ingest.log.addHandler(handler)
     ingest.log.setLevel(logging.INFO)
@@ -250,6 +260,8 @@ def main(argv: list[str] | None = None) -> int:
                 raise ValueError("the question is empty")
             if args.mode not in semantic.MODES:
                 raise ValueError(f"unknown mode '{args.mode}'; valid modes: {', '.join(semantic.MODES)}")
+            args.limit = semantic.check_limit(int(args.limit) if re.fullmatch(r"-?[0-9]+", args.limit) else None)
+            semantic.check_language(args.language)
         if args.run in GRAPH:  # refuse bad input before touching the database
             graph.check_name(args.name)
             if args.run is _impact:  # a bad --depth exits 1, not argparse's 2

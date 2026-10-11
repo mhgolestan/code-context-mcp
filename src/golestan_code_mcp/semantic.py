@@ -16,6 +16,7 @@ from pathlib import Path
 import oracledb
 
 from golestan_code_mcp import db
+from golestan_code_mcp.chunker import EXTENSIONS
 from golestan_code_mcp.config import (
     environment,
     model_cache,
@@ -29,6 +30,10 @@ from golestan_code_mcp.registry import repo_id
 MODEL = "ALL_MINILM_L12_V2"
 DIMENSION = 384
 LIMIT = 10
+MAX_LIMIT = 50
+LANGUAGES = tuple(sorted(set(EXTENSIONS.values()) | {"text"}))  # every language the chunker assigns
+SNIPPET_LINES = 10
+SNIPPET_CHARS = 800
 FLOOR = 0.3
 INDEX = "CCCTX_SYMBOLS_HYBRID_IX"
 LEXER = "CCCTX_CODE_LEXER"
@@ -61,6 +66,26 @@ class Result:
     path: str
     start_line: int
     end_line: int
+    language: str
+    snippet: str  # the opening of the stored source: at most SNIPPET_LINES lines and SNIPPET_CHARS characters
+
+
+def check_limit(limit) -> int:
+    """The limit, if it is an integer from 1 to MAX_LIMIT. Needs no database."""
+    if isinstance(limit, bool) or not isinstance(limit, int) or not 1 <= limit <= MAX_LIMIT:
+        raise ValueError(f"limit must be between 1 and {MAX_LIMIT}")
+    return limit
+
+
+def check_language(language: str | None) -> str | None:
+    """The language, if it is None or one the chunker assigns. Needs no database."""
+    if language is not None and language not in LANGUAGES:
+        raise ValueError(f"unknown language '{language}'; valid languages: {', '.join(LANGUAGES)}")
+    return language
+
+
+def _snippet(text: str | None) -> str:
+    return "\n".join((text or "").split("\n")[:SNIPPET_LINES]).rstrip("\r\n")
 
 
 def _state(cur) -> tuple[bool, int | None, bool]:
@@ -163,25 +188,27 @@ def _hybrid(cur, request: dict) -> list[dict]:
 
 
 def _symbols(cur, rowids: list[str]) -> dict[str, tuple]:
-    """rowid -> (repo id, repo, kind, name, path, start, end) for the given symbol rowids."""
+    """rowid -> (repo id, repo, kind, name, path, start, end, language, snippet) for the given symbol rowids."""
     found = {}
     for i in range(0, len(rowids), 500):  # stay well inside Oracle's 1000-item IN list
         chunk = rowids[i:i + 500]
         binds = ", ".join(f"chartorowid(:{n + 1})" for n in range(len(chunk)))
         cur.execute(
-            f"""select rowidtochar(s.rowid), r.id, r.name, s.kind, s.name, f.path, s.start_line, s.end_line
+            f"""select rowidtochar(s.rowid), r.id, r.name, s.kind, s.name, f.path, s.start_line, s.end_line,
+                       f.language, dbms_lob.substr(s.source, {SNIPPET_CHARS}, 1)
                   from ccctx_symbols s join ccctx_files f on f.id = s.file_id join ccctx_repos r on r.id = f.repo_id
                  where s.rowid in ({binds})""",
             chunk,
         )
-        found.update({row[0]: row[1:] for row in cur})
+        found.update({row[0]: (*row[1:-1], _snippet(row[-1])) for row in cur})
     return found
 
 
 def _definitions(cur, name: str) -> dict[str, tuple]:
     """Symbols whose name, or the last part of their dotted name, equals the identifier (any case)."""
     cur.execute(
-        """select rowidtochar(s.rowid), r.id, r.name, s.kind, s.name, f.path, s.start_line, s.end_line
+        f"""select rowidtochar(s.rowid), r.id, r.name, s.kind, s.name, f.path, s.start_line, s.end_line,
+                       f.language, dbms_lob.substr(s.source, {SNIPPET_CHARS}, 1)
              from ccctx_symbols s join ccctx_files f on f.id = s.file_id join ccctx_repos r on r.id = f.repo_id
             where s.kind <> 'chunk'
               and (lower(s.name) = :q
@@ -189,23 +216,31 @@ def _definitions(cur, name: str) -> dict[str, tuple]:
             order by f.path, s.start_line""",
         q=name.lower(),
     )
-    return {row[0]: row[1:] for row in cur}
+    return {row[0]: (*row[1:-1], _snippet(row[-1])) for row in cur}
 
 
 def search(conn, question: str, repos: list[str] | None = None, mode: str = "hybrid",
-           env: Mapping[str, str] | None = None) -> list[Result]:
-    """At most LIMIT symbols for the question. Identifier definitions first, then fused order.
+           env: Mapping[str, str] | None = None, language: str | None = None, limit: int = LIMIT) -> list[Result]:
+    """At most `limit` symbols for the question. Identifier definitions first, then fused order.
 
     hybrid: keyword and semantic sides fused with RRF (UNION). vector: semantic side only, none below FLOOR.
     text: keyword side only, every word must appear. `repos` narrows to those repositories; None searches all.
+    `language` narrows to files of that language. A hit is in scope when its repository and language both match.
     """
     question = (question or "").strip()
     if not question:
         raise ValueError("the question is empty")
     if mode not in MODES:
         raise ValueError(f"unknown mode '{mode}'; valid modes: {', '.join(MODES)}")
+    check_limit(limit)
+    check_language(language)
     env = environment() if env is None else env
     wanted = {repo_id(conn, name) for name in repos} if repos else None  # unknown names refused before searching
+
+    def in_scope(s: tuple) -> bool:
+        return (wanted is None or s[0] in wanted) and (language is None or s[7] == language)
+
+    scoped = wanted is not None or language is not None
     require_model(conn)
 
     request: dict = {"hybrid_index_name": INDEX, "return": {"topN": search_candidates(env)}}
@@ -218,7 +253,7 @@ def search(conn, question: str, repos: list[str] | None = None, mode: str = "hyb
         request |= {"search_scorer": "rrf", "search_fusion": "UNION"}
 
     with conn.cursor() as cur:
-        hits, symbols = _candidates(cur, request, wanted)
+        hits, symbols = _candidates(cur, request, in_scope if scoped else None, limit)
         definitions = _definitions(cur, question) if mode != "vector" and IDENTIFIER.fullmatch(question) else {}
 
     # One entry per symbol (its best chunk), in fused order, inside the chosen repositories. Fallback windows
@@ -226,10 +261,10 @@ def search(conn, question: str, repos: list[str] | None = None, mode: str = "hyb
     fused, seen = [], set()
     for h in hits:
         rowid = h["rowid"]
-        if rowid in seen or rowid not in symbols or (wanted is not None and symbols[rowid][0] not in wanted):
+        if rowid in seen or rowid not in symbols or not in_scope(symbols[rowid]):
             continue
         seen.add(rowid)
-        rid, _, kind, _, path, _, _ = symbols[rowid]
+        rid, _, kind, _, path, *_ = symbols[rowid]
         if kind == "chunk":
             if (rid, path) in seen:
                 continue
@@ -248,9 +283,9 @@ def search(conn, question: str, repos: list[str] | None = None, mode: str = "hyb
 
     by_rowid = {f["rowid"]: f for f in fused}
     first = [by_rowid.get(r) or {"rowid": r, "score": 0.0, "similarity": None, "text": None, "vector": None}
-             for r, d in definitions.items() if wanted is None or d[0] in wanted]
+             for r, d in definitions.items() if in_scope(d)]
     first.sort(key=lambda f: (f["rowid"] not in by_rowid, -f["score"]))  # found by the search first, then path
-    ordered = (first + [f for f in fused if f["rowid"] not in definitions])[:LIMIT]
+    ordered = (first + [f for f in fused if f["rowid"] not in definitions])[:limit]
 
     return [
         Result(rank, f["score"], f["similarity"], f["text"], f["vector"], *(symbols.get(f["rowid"]) or definitions[f["rowid"]])[1:])
@@ -258,16 +293,16 @@ def search(conn, question: str, repos: list[str] | None = None, mode: str = "hyb
     ]
 
 
-def _candidates(cur, request: dict, wanted: set[int] | None) -> tuple[list[dict], dict[str, tuple]]:
-    """Hits and their symbols. With a repository filter, widen the pool until LIMIT of them are in scope."""
+def _candidates(cur, request: dict, in_scope, limit: int) -> tuple[list[dict], dict[str, tuple]]:
+    """Hits and their symbols. With a repository or language filter, widen the pool until `limit` are in scope."""
     if "vector" not in request and "text" not in request:
         return [], {}
     while True:
         hits = _hybrid(cur, request)
         symbols = _symbols(cur, list(dict.fromkeys(h["rowid"] for h in hits)))
         topn = request["return"]["topN"]
-        in_scope = {r for r, s in symbols.items() if wanted is None or s[0] in wanted}
+        found = sum(1 for s in symbols.values() if in_scope is None or in_scope(s))
         # simplified: stops at MAX_CANDIDATES; a tiny repository beside huge ones may still return fewer
-        if wanted is None or len(in_scope) >= LIMIT or len(hits) < topn or topn >= MAX_CANDIDATES:
+        if in_scope is None or found >= limit or len(hits) < topn or topn >= MAX_CANDIDATES:
             return hits, symbols
         request["return"]["topN"] = min(topn * 4, MAX_CANDIDATES)

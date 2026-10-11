@@ -1,6 +1,6 @@
 # golestan_code_mcp
 
-A code context MCP server backed by Oracle AI Database 26ai. This step sets up the local development environment: the database, the Python project, sample repositories and a stub server with one `health` tool.
+A code context MCP server backed by Oracle AI Database 26ai. It indexes codebases into the database, searches them by name and meaning, follows their calls, and serves all of it to AI coding tools over MCP (`ccctx mcp`).
 
 ## Prerequisites
 
@@ -169,6 +169,7 @@ uv run ccctx search "url_for" --mode text                           # only symbo
 uv run ccctx search "how are incoming requests routed to handlers"  # by meaning
 uv run ccctx search "middleware chain" --repo gin                   # one repository
 uv run ccctx search "routing" --repo flask,gin                      # or several (also: --repo flask --repo gin)
+uv run ccctx search "middleware chain" --language go --limit 3      # one language, three results
 ```
 
 ```text
@@ -189,7 +190,7 @@ How results are ranked:
 - **Definitions first**: when the query is an identifier, the symbols named exactly that, or ending in `.<identifier>` such as `Flask.url_for`, come before everything else in `hybrid` and `text` mode. Matching ignores case.
 - **Similarity floor**: a result found only by meaning must have a cosine similarity of at least 0.3, so an unrelated question returns nothing rather than ten weak matches. Keyword matches always count.
 - **One window per file**: of a file's fallback line windows, only the best one is shown.
-- **At most 10 results.** Query text is always taken literally: `_`, `-`, `&`, quotes and parentheses are never search operators.
+- **10 results by default**, `--limit` 1 to 50. `--language` keeps one language (`python`, `go`, `javascript`, `markdown` and the other languages the chunker assigns). Query text is always taken literally: `_`, `-`, `&`, quotes and parentheses are never search operators.
 - **Why each result ranked**: `SCORE` is the fused score (or the single side's score in `text` and `vector` mode). `KEYWORD` and `SEMANTIC` are its rank on each side among the repositories searched, with `-` when that side did not find it.
 
 Fusion settings:
@@ -198,7 +199,7 @@ Fusion settings:
 |---|---|---|
 | `CCCTX_TEXT_WEIGHT` | `1` | Weight of the keyword side in the fusion |
 | `CCCTX_VECTOR_WEIGHT` | `1` | Weight of the semantic side in the fusion |
-| `CCCTX_SEARCH_CANDIDATES` | `100` | Rows asked of the index before scoping and the cap of 10; widened automatically, up to 4000, when `--repo` filters most of them out |
+| `CCCTX_SEARCH_CANDIDATES` | `100` | Rows asked of the index before scoping and the result cap; widened automatically, up to 4000, when `--repo` filters most of them out |
 
 ## Code relationships
 
@@ -264,46 +265,65 @@ The second count matches the first. `docker compose down` also keeps the data. O
 
 ## The MCP server
 
-The server talks MCP over standard input and output. It has six tools:
+`ccctx mcp` runs the server over standard input and output. There is no network port and no login: the client starts it as a child process. It finds its database settings the same way the CLI does, from the environment and then `.env` in this checkout, whatever directory the client starts it in.
 
-- `health` returns the server name, version and whether the database is reachable.
-- `list_repositories` returns the registered repositories with their paths and file and symbol counts, the same as `ccctx repo list`.
-- `search` takes a `question`, an optional `mode` (`hybrid`, `text` or `vector`) and optional `repos` (or a single `repo`), and returns the same results as `ccctx search`: `status` `ok` or `unavailable`, and each result's `score`, `keyword_rank`, `semantic_rank` and `similarity`.
-- `callers` and `calls` take a `name` and optional `repos` (or `repo`); `impact` also takes a `depth` (1 to 5, default 3). They return the same rows as `ccctx callers`, `ccctx calls` and `ccctx impact`, at most 200, with `truncated` set when there were more.
-
-A stopped database gives `"database": "unreachable"` with a reason, not an error.
-
-**MCP Inspector:**
+**Install the command once**, from the project root, so a client can start `ccctx` from any directory:
 
 ```sh
-uv run mcp dev src/golestan_code_mcp/server.py
+uv tool install --editable .
 ```
 
-Open the URL it prints, connect, then **Tools → List Tools → health → Run Tool**.
+The editable install keeps `.env` in reach. With a non-editable install there is no `.env` next to the package, so give the settings to the client instead: `claude mcp add ccctx -e DB_USER=... -e DB_PASSWORD=... -- ccctx mcp`.
 
-**Claude Code:** add the server from the project root:
+**Tools.** Each tool's description says what it answers and when to use one of the others instead. They are all read-only.
 
-```powershell
-claude mcp add golestan_code_mcp -- uv run --directory "$PWD" golestan-code-mcp    # PowerShell
-```
+| Tool | Parameters | Returns |
+|---|---|---|
+| `search_code` | `query`, `repo`, `language`, `limit` (default 10, 1 to 50) | Hits with repository, path, symbol name, kind, language, line range, a snippet (the first 10 lines, at most 800 characters) and the fused, keyword and semantic scores. The same hits as `ccctx search`. |
+| `get_symbol` | `name`, `repo` | Up to 5 definitions with that name, each with its full indexed source, path and line range. A source over 400 lines is cut and marked `cut`. `total` and `truncated` say whether more matched. |
+| `find_callers` | `name`, `repo` | The rows of `ccctx callers`. |
+| `find_callees` | `name`, `repo` | The rows of `ccctx calls`. |
+| `impact_of` | `name`, `depth` (default 3, 1 to 5), `repo` | The rows of `ccctx impact`, with hop counts. |
+| `list_repositories` | none | The registered repositories, the same as `ccctx repo list`. |
+
+- **Names** work as in the graph commands: a bare `url_for` matches every `url_for`, and `Flask.url_for` only that method.
+- **Limits:** the graph tools return at most 200 rows, with `truncated` set when there were more.
+- **Refusals:** bad input, an unknown repository or language, a missing model and a stopped database all come back as `"status": "unavailable"` with a reason. A call with an argument the tool does not take is refused.
+- **Logging:** each call writes one line to standard error with the tool, time, status and result count.
+
+**Changed in 1.0.0.**
+- **Renamed tools:** `search` is now `search_code`, `callers` is now `find_callers`, `calls` is now `find_callees`, and `impact` is now `impact_of`.
+- **Removed:** `health`. A failed call says when the database is unreachable.
+- **Parameters:** the `repos` list became one `repo`, and `search` lost `question` (now `query`) and `mode` (always hybrid).
+- **Old registrations:** `golestan-code-mcp` still starts the same server.
+
+**MCP Inspector**: lists the tools and calls them by hand.
+
 ```sh
-claude mcp add golestan_code_mcp -- uv run --directory "$(pwd)" golestan-code-mcp  # POSIX
+npx @modelcontextprotocol/inspector ccctx mcp
 ```
 
-Or put this in a `.mcp.json` (use your absolute project path):
+Open the URL it prints, connect, then **Tools → List Tools**. To compare with the CLI, call `search_code` with `{"query": "how are requests routed", "repo": "flask"}`: it returns the same 10 symbols in the same order as `ccctx search "how are requests routed" --repo flask`.
 
-```json
-{
-  "mcpServers": {
-    "golestan_code_mcp": {
-      "command": "uv",
-      "args": ["run", "--directory", "<absolute project path>", "golestan-code-mcp"]
-    }
-  }
-}
+**Claude Code**:
+
+```sh
+claude mcp add ccctx -- ccctx mcp
 ```
 
-Then run `/mcp` in Claude Code and ask it to call the `health` tool.
+Start a session in any other directory and ask, for example, "using ccctx, how does Flask decide which view function handles a request?".
+
+**Which tool a client picks.** Five questions were run through Claude Code with `claude -p`, its built-in tools turned off and only this server connected. Each question was written so one tool is the right first step. The client called that tool first every time:
+
+| Question | First call | Then |
+|---|---|---|
+| using ccctx, how does Flask decide which view function handles a request? | `search_code` | `get_symbol` ×6, a narrower `search_code`, `find_callers` |
+| show me the full source of Flask.dispatch_request | `get_symbol` | none |
+| what calls url_for in flask? | `find_callers` | none |
+| if I change Flask.url_for, what could break? | `impact_of` | `get_symbol`, `find_callers`, `search_code` |
+| what does Flask.full_dispatch_request call? | `find_callees` | `get_symbol` |
+
+Its routing answer traced registration through `App.add_url_rule` into `url_map` and `view_functions`. It then traced each request through `Flask.wsgi_app`, `AppContext.match_request` and `Flask.dispatch_request`, citing paths and lines. It never asked to open a file.
 
 ## Layout
 
@@ -316,8 +336,9 @@ src/golestan_code_mcp/    config, db check, sample cloner, MCP server
   registry.py             register and list repositories (shared by CLI and MCP)
   chunker.py              tree-sitter chunks for Python, Go, JavaScript; line-window fallback
   ingest.py               list files with read-only git, skip rules, full or incremental re-index of one repository
-  semantic.py             model and hybrid index setup, hybrid / text / vector search
-  graph.py                call and import edges from stored refs; callers, calls, impact via GRAPH_TABLE
+  semantic.py             model and hybrid index setup, hybrid / text / vector search, language and count filters
+  graph.py                call and import edges from stored refs; callers, calls, impact via GRAPH_TABLE; definitions
+  server.py               the six MCP tools (`ccctx mcp`)
   cli.py                  the ccctx command
 tests/                    pytest suite and chunker fixtures
 ```

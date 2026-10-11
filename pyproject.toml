@@ -1,6 +1,6 @@
 [project]
 name = "golestan-code-mcp"
-version = "0.1.0"
+version = "1.0.0"
 description = "Code context MCP server backed by Oracle AI Database 26ai"
 readme = "README.md"
 requires-python = ">=3.11"

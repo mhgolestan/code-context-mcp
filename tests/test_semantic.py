@@ -1,18 +1,23 @@
-"""Hybrid search core (contracts/schema.md, contracts/cli.md): model setup, the hybrid index, modes, scoping.
+"""Hybrid search core (contracts/schema.md, contracts/cli.md, 008 contracts/tools.md `search_code`): model setup,
+the hybrid index, modes, scoping by repository and language, the result count and snippets.
 
 Tests that need the database skip when it is down; tests that search skip when the hybrid index is not built.
-Every search names the throwaway repositories, so other indexed code never leaks into the assertions.
+Every search names the throwaway repositories, so other indexed code never leaks into the assertions, and the
+teardown removes only this run's repositories, so parallel test runs keep theirs.
 """
 
+import re
 import uuid
 
 import pytest
 
-from golestan_code_mcp import db, registry, schema, semantic
+from golestan_code_mcp import chunker, db, registry, schema, semantic
 from golestan_code_mcp.config import load
 
 RUN = uuid.uuid4().hex[:6]
-A, B = f"t-{RUN}a", f"t-{RUN}b"
+A, B, C = f"t-{RUN}a", f"t-{RUN}b", f"t-{RUN}c"
+TOKEN = f"quokka_{RUN}"  # appears in every symbol of C and nowhere else
+LANGUAGE_LIST = "batch, css, go, html, ini, javascript, json, markdown, proto, python, rst, shell, sql, text, toml, yaml"
 
 SYMBOLS = {
     A: [
@@ -35,6 +40,13 @@ SYMBOLS = {
         ("handleChain", "function", "context.go",
          "func handleChain(c *Context) {\n\t// run each middleware in the chain for the request, then the handler\n"
          "\tfor c.index < len(c.handlers) { c.handlers[c.index](c); c.index++ }\n}\n"),
+    ],
+    C: [  # 4 Go and 6 Python symbols sharing TOKEN; the language comes from the path, as the chunker assigns it
+        *[(f"Quokka{i}", "function", f"q{i}.go", f"func Quokka{i}() {{\n\t// {TOKEN}\n}}\n") for i in range(4)],
+        *[(f"quokka_py{i}", "function", f"q{i}.py", f"def quokka_py{i}():\n    # {TOKEN}\n    pass\n")
+          for i in range(4)],
+        ("tall", "function", "tall.py", "def tall():\n" + "".join(f"    x{n} = '{TOKEN}'\n" for n in range(30))),
+        ("wide", "function", "wide.py", f"def wide():\n    return '{TOKEN}' + '" + "w" * 1000 + "'\n"),
     ],
 }
 
@@ -82,6 +94,42 @@ def test_failed_download_names_the_url_and_leaves_nothing(tmp_path):
     assert list(tmp_path.iterdir()) == []
 
 
+@pytest.mark.parametrize("limit", [0, 51, -1, 2.5, "3"])
+def test_limit_outside_1_to_50_refused(limit):
+    with pytest.raises(ValueError, match="^limit must be between 1 and 50$"):
+        semantic.check_limit(limit)
+    with pytest.raises(ValueError, match="^limit must be between 1 and 50$"):
+        semantic.search(None, "url_for", limit=limit)
+
+
+@pytest.mark.parametrize("limit", [1, 10, 50])
+def test_limit_inside_1_to_50_accepted(limit):
+    semantic.check_limit(limit)  # must not raise
+
+
+def test_languages_are_the_chunkers_plus_text():
+    assert sorted(semantic.LANGUAGES) == sorted({*chunker.EXTENSIONS.values(), "text"})
+    assert ", ".join(sorted(semantic.LANGUAGES)) == LANGUAGE_LIST
+
+
+def test_unknown_language_refused_before_connecting(monkeypatch):
+    monkeypatch.setenv("DB_PORT", "1")  # no connection is made: conn is None and the port is closed
+    reason = "^" + re.escape(f"unknown language 'cobol'; valid languages: {LANGUAGE_LIST}") + "$"
+    with pytest.raises(ValueError, match=reason):
+        semantic.check_language("cobol")
+    with pytest.raises(ValueError, match=reason):
+        semantic.search(None, "url_for", language="cobol")
+    for language in ("python", "go", "text"):
+        semantic.check_language(language)  # must not raise
+
+
+def test_question_then_limit_then_language_checked():
+    with pytest.raises(ValueError, match="question"):
+        semantic.search(None, "  ", language="cobol", limit=0)
+    with pytest.raises(ValueError, match="limit"):
+        semantic.search(None, "url_for", language="cobol", limit=0)
+
+
 # --- database and hybrid index ----------------------------------------------------------------------------
 
 
@@ -99,7 +147,7 @@ def conn():
         pytest.skip("hybrid index not built: run `ccctx model load`")
     yield conn
     with conn.cursor() as cur:
-        cur.execute("delete from ccctx_repos where name like 't-%'")
+        cur.execute("delete from ccctx_repos where name like :p", p=f"t-{RUN}%")
     conn.commit()
     conn.close()
 
@@ -117,7 +165,7 @@ def add_symbol(cur, file_id, name, kind, path, source):
 
 @pytest.fixture(scope="module")
 def repos(conn):
-    """Two throwaway repositories whose symbols the hybrid index picks up on commit."""
+    """Three throwaway repositories whose symbols the hybrid index picks up on commit."""
     with conn.cursor() as cur:
         for repo, symbols in SYMBOLS.items():
             rid = cur.var(int)
@@ -126,11 +174,11 @@ def repos(conn):
             for name, kind, path, source in symbols:
                 fid = cur.var(int)
                 cur.execute("insert into ccctx_files (repo_id, path, language, content_hash)"
-                            " values (:r, :p, 'python', :h) returning id into :i",
-                            r=rid.getvalue()[0], p=path, h="0" * 64, i=fid)
+                            " values (:r, :p, :l, :h) returning id into :i",
+                            r=rid.getvalue()[0], p=path, l=chunker.detect_language(path), h="0" * 64, i=fid)
                 add_symbol(cur, fid.getvalue()[0], name, kind, path, source)
     conn.commit()
-    return A, B
+    return A, B, C
 
 
 def names(results):
@@ -230,3 +278,55 @@ def test_fresh_commit_is_searchable_at_once(conn, repos):
 
 def test_operator_words_stay_literal():
     assert semantic.text_query("NOT near and", every_word=False) == "{NOT} ACCUM {near} ACCUM {and}"
+
+
+# --- language, limit and snippets (008 contracts/tools.md `search_code`) ----------------------------------
+
+
+def opening(source: str) -> str:
+    """The contract's snippet: the source's first 10 lines, cut to 800 characters, no trailing newline."""
+    return "\n".join(source[:800].split("\n")[:10]).rstrip("\n")
+
+
+def in_language(repo, language):
+    return [name for name, _, path, _ in SYMBOLS[repo] if chunker.detect_language(path) == language]
+
+
+@pytest.mark.parametrize("language", ["python", "go"])
+def test_language_keeps_only_that_language(conn, repos, language):
+    results = semantic.search(conn, TOKEN, [C], language=language, limit=50)
+    assert sorted(names(results)) == sorted(in_language(C, language))
+    assert {r.language for r in results} == {language}
+
+
+def test_repo_and_language_still_fill_limit(conn, repos):
+    # a 2-hit pool holds out-of-scope hits; widening must go on until `limit` in-scope hits are found
+    results = semantic.search(conn, TOKEN, [C], language="go", limit=4, env={"CCCTX_SEARCH_CANDIDATES": "2"})
+    assert sorted(names(results)) == sorted(in_language(C, "go"))
+
+
+def test_limit_caps_the_hits(conn, repos):
+    results = semantic.search(conn, TOKEN, [C], limit=3)
+    assert len(results) == 3 and [r.rank for r in results] == [1, 2, 3]
+
+
+def test_every_hit_has_its_language_and_opening_snippet(conn, repos):
+    sources = {name: source for name, _, _, source in SYMBOLS[C]}
+    results = semantic.search(conn, TOKEN, [C], limit=50)
+    assert sorted(names(results)) == sorted(sources)
+    for r in results:
+        assert r.language == chunker.detect_language(r.path)
+        assert r.snippet == opening(sources[r.name])
+        assert len(r.snippet) <= 800 and r.snippet.count("\n") <= 9 and not r.snippet.endswith("\n")
+    by_name = {r.name: r for r in results}
+    assert by_name["tall"].snippet.count("\n") == 9  # 31 lines stored, 10 shown
+    assert by_name["wide"].snippet == sources["wide"][:800]  # a 1000-character second line, cut at 800 characters
+
+
+def test_defaults_give_the_same_hits_as_before(conn, repos):
+    def key(results):
+        return [(r.rank, r.name, r.score, r.keyword_rank, r.semantic_rank, r.similarity) for r in results]
+
+    before = semantic.search(conn, "url_for", [A])
+    assert key(semantic.search(conn, "url_for", [A], language=None, limit=semantic.LIMIT)) == key(before)
+    assert key(semantic.search(conn, "url_for", [A], language="python")) == key(before)  # all of A is Python

@@ -1,9 +1,11 @@
 """ccctx command line (contracts/cli.md). Database cases skip when it is unreachable."""
 
+import re
 import subprocess
 import time
 import uuid
 from collections import Counter
+from dataclasses import replace
 
 import pytest
 
@@ -288,3 +290,44 @@ def test_search_unreachable_exits_2(capsys, monkeypatch):
     started = time.monotonic()
     code, out, err = run(capsys, "search", "routing")
     assert time.monotonic() - started < 5 and code == 2 and FAKE_PW not in out + err
+
+
+# --- incremental ingest (006) -------------------------------------------------------------------------------
+
+
+def test_format_incremental_summary():
+    s = replace(summary(no_grammar=3, files=8, symbols=84), mode="incremental",
+                added=2, changed=6, removed=1, unchanged=227)
+    assert cli.format_summary(s).splitlines() == [
+        "Changed     9 files (2 added, 6 changed, 1 removed)",
+        "Unchanged 227 files",
+        "Skipped     0 files",
+        "Indexed    84 symbols in 9.2s",
+        "Fallback    3 files as line windows (3 no grammar, 0 parse errors)",
+    ]
+
+
+def test_format_up_to_date():
+    s = replace(summary(files=0, symbols=0), commit="0123456789ab" + "c" * 28, mode="current", unchanged=176)
+    assert cli.format_summary(s) == "flask is already up to date at 0123456789ab; run with --full to re-index anyway"
+
+
+def untimed(out):
+    return re.sub(r"in [0-9.]+s", "", out)
+
+
+def test_ingest_again_then_full(ingested, capsys):
+    n, first = ingested
+    code, out, _ = run(capsys, "ingest", n)
+    assert code == 0 and out.startswith(f"{n} is already up to date at ") and "--full" in out
+    code, out, _ = run(capsys, "ingest", n, "--full")
+    assert code == 0 and untimed(out) == untimed(first)  # same counts as the first ingest (SC-004)
+    assert [line.split()[0] for line in out.splitlines()] == ["Scanned", "Skipped", "Indexed", "Fallback"]
+
+
+def test_note_goes_to_stderr(live, capsys, monkeypatch):
+    monkeypatch.setattr(ingest, "ingest", lambda conn, name, full=False: replace(
+        summary(), note="no recorded revision for 'flask'; indexing in full"))
+    code, out, err = run(capsys, "ingest", "flask")
+    assert code == 0 and out.startswith("Scanned")
+    assert "note: no recorded revision for 'flask'; indexing in full" in err

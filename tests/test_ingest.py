@@ -103,6 +103,8 @@ def test_git_helper_is_read_only(repo):
     before = (repo / ".git" / "index").read_bytes()
     ingest.discover(repo, ENV)
     ingest.git(repo, "status", "--porcelain")
+    ingest.git(repo, "diff", "--name-only", "-z", "--no-renames", head(repo), "--")
+    ingest.git(repo, "rev-parse", "--verify", "--quiet", f"{head(repo)}^{{commit}}")
     assert (repo / ".git" / "index").read_bytes() == before
 
 
@@ -147,6 +149,43 @@ def stored(conn, name):
         return [tuple(v.read() if hasattr(v, "read") else v for v in row) for row in cur]
 
 
+def revision(conn, name):
+    with conn.cursor() as cur:
+        return cur.execute("select indexed_commit, indexed_dirty from ccctx_repos where name = :n", n=name).fetchone()
+
+
+def content(conn, name):
+    """Stored rows without commit_sha, which unchanged files keep from the run that last read them."""
+    return sorted(repr(row[:9]) for row in stored(conn, name))
+
+
+def symbol_ids(conn, name, path):
+    with conn.cursor() as cur:
+        cur.execute(
+            """select s.id from ccctx_symbols s join ccctx_files f on f.id = s.file_id
+                 join ccctx_repos r on r.id = f.repo_id where r.name = :n and f.path = :p order by s.id""",
+            n=name, p=path,
+        )
+        return [row[0] for row in cur]
+
+
+def named_ids(conn, name, path):
+    with conn.cursor() as cur:
+        cur.execute(
+            """select s.name, s.id from ccctx_symbols s join ccctx_files f on f.id = s.file_id
+                 join ccctx_repos r on r.id = f.repo_id where r.name = :n and f.path = :p""",
+            n=name, p=path,
+        )
+        return dict(cur.fetchall())
+
+
+def assert_matches_full(conn, name):
+    """FR-006, SC-005: the incremental index is what a full rebuild of the same tree stores."""
+    before = content(conn, name)
+    assert ingest.ingest(conn, name, ENV, full=True).mode == "full"
+    assert content(conn, name) == before
+
+
 def test_ingest_summary_and_rows(conn, repo, caplog):
     name = register(conn, repo)
     with caplog.at_level(logging.INFO, logger="golestan_code_mcp.ingest"):
@@ -177,13 +216,18 @@ def test_ingest_summary_and_rows(conn, repo, caplog):
     assert record["event"] == "ingest" and record["commit"] == summary.commit and record["symbols"] == summary.symbols
 
 
-def test_reingest_replaces(conn, repo):
+def test_unchanged_reingest_is_current(conn, repo, caplog):
     name = register(conn, repo)
     first = ingest.ingest(conn, name, ENV)
+    assert (first.mode, first.note) == ("full", None) and revision(conn, name) == (head(repo), False)  # FR-001
     rows = stored(conn, name)
-    second = ingest.ingest(conn, name, ENV)
-    assert (second.files, second.symbols) == (first.files, first.symbols)
-    assert sorted(map(repr, stored(conn, name))) == sorted(map(repr, rows))  # SC-005: one copy, same content
+    with caplog.at_level(logging.INFO, logger="golestan_code_mcp.ingest"):
+        second = ingest.ingest(conn, name, ENV)
+    assert second.mode == "current" and (second.files, second.symbols) == (0, 0)  # FR-002
+    assert (second.added, second.changed, second.removed, second.unchanged) == (0, 0, 0, first.files)
+    assert stored(conn, name) == rows
+    record = json.loads(caplog.records[-1].getMessage())
+    assert record["mode"] == "current" and record["unchanged"] == first.files  # FR-012
 
 
 def test_failed_ingest_keeps_previous_index(conn, repo, monkeypatch):
@@ -199,6 +243,7 @@ def test_failed_ingest_keeps_previous_index(conn, repo, monkeypatch):
     with pytest.raises(RuntimeError):
         ingest.ingest(conn, name, ENV)
     assert stored(conn, name) == before
+    assert revision(conn, name) == (head(repo), False)  # FR-007, SC-006
 
 
 def test_every_symbol_gets_search_text(conn, repo):
@@ -274,3 +319,120 @@ def test_concurrent_ingest_refused(conn, repo):
     finally:
         other.rollback()
         other.close()
+
+
+# --- incremental re-ingest ----------------------------------------------------------------------------------
+
+
+def write(path, text):
+    path.write_text(text, encoding="utf-8", newline="\n")
+
+
+def test_uncommitted_edit_at_same_head_is_indexed(conn, repo):
+    name = register(conn, repo)
+    ingest.ingest(conn, name, ENV)
+    write(repo / "app.py", APP_PY + "\n\ndef extra():\n    pass\n")
+    s = ingest.ingest(conn, name, ENV)
+    assert (s.mode, s.added, s.changed, s.removed) == ("incremental", 0, 1, 0) and s.dirty
+    assert revision(conn, name) == (head(repo), True)
+    assert "extra" in {r[3] for r in stored(conn, name)}
+    git(repo, "checkout", "--", "app.py")  # back to the commit: only the dirty flag reveals the stale rows
+    s = ingest.ingest(conn, name, ENV)
+    assert (s.mode, s.changed) == ("incremental", 1) and revision(conn, name) == (head(repo), False)
+    assert "extra" not in {r[3] for r in stored(conn, name)}
+    assert_matches_full(conn, name)
+
+
+def test_only_changed_files_are_reprocessed(conn, repo):
+    name = register(conn, repo)
+    first = ingest.ingest(conn, name, ENV)
+    kept = symbol_ids(conn, name, "app.py")
+    main_id = symbol_ids(conn, name, "main.go")
+    write(repo / "main.go", MAIN_GO + "\nfunc other() {\n}\n")
+    (repo / "lib").mkdir()
+    git(repo, "mv", "web.js", "lib/web.js")
+    git(repo, "rm", "-q", "notes.txt")
+    write(repo / "new.py", "def fresh():\n    pass\n")
+    git(repo, "add", "-A")
+    git(repo, "commit", "-q", "-m", "change")
+    write(repo / "extra.py", "def untracked():\n    pass\n")
+
+    s = ingest.ingest(conn, name, ENV)
+    assert s.mode == "incremental" and s.commit == head(repo) and not s.dirty
+    assert (s.added, s.changed, s.removed, s.unchanged) == (3, 1, 2, 4)  # FR-008
+    rewritten = {"main.go", "lib/web.js", "new.py", "extra.py"}
+    # main.go's untouched `main` keeps its row; only its new `other` is inserted and embedded
+    assert s.files == 4 and s.symbols == len([r for r in stored(conn, name) if r[0] in rewritten]) - 1
+    assert main_id[0] in symbol_ids(conn, name, "main.go")
+    paths = {r[0] for r in stored(conn, name)}
+    assert rewritten <= paths and not {"web.js", "notes.txt"} & paths  # FR-005
+    assert symbol_ids(conn, name, "app.py") == kept  # FR-004: unchanged rows are not rewritten
+    assert {r[9] for r in stored(conn, name) if r[0] == "app.py"} == {first.commit}
+    assert revision(conn, name) == (head(repo), False)
+    assert_matches_full(conn, name)
+
+
+def test_change_reverted_in_a_later_commit_is_unchanged(conn, repo):
+    name = register(conn, repo)
+    ingest.ingest(conn, name, ENV)
+    write(repo / "app.py", "x = 1\n")
+    git(repo, "commit", "-q", "-am", "edit")
+    git(repo, "revert", "--no-edit", "HEAD")
+    s = ingest.ingest(conn, name, ENV)
+    assert (s.mode, s.added, s.changed, s.removed, s.unchanged) == ("incremental", 0, 0, 0, 7)
+    assert revision(conn, name) == (head(repo), False)  # the revision moves even with nothing to re-index
+
+
+def test_deleted_and_newly_skipped_files_leave_the_index(conn, repo):
+    name = register(conn, repo)
+    ingest.ingest(conn, name, ENV)
+    (repo / "app.py").unlink()
+    write(repo / "main.go", "x" * 3000)  # now too large
+    (repo / "web.js").write_bytes(b"\x00binary")
+    s = ingest.ingest(conn, name, ENV)
+    assert (s.mode, s.added, s.changed, s.removed) == ("incremental", 0, 0, 3)
+    assert not {"app.py", "main.go", "web.js"} & {r[0] for r in stored(conn, name)}  # FR-005, SC-003
+    assert all(r.path != "app.py" for r in semantic.search(conn, "helper", [name], mode="text"))
+    assert_matches_full(conn, name)
+
+
+def test_full_rebuild_on_up_to_date_repository(conn, repo):
+    name = register(conn, repo)
+    first = ingest.ingest(conn, name, ENV)
+    s = ingest.ingest(conn, name, ENV, full=True)  # FR-009, SC-004
+    assert s.mode == "full" and s.note is None and (s.files, s.symbols) == (first.files, first.symbols)
+
+
+@pytest.mark.parametrize(("recorded", "note"), [
+    (None, "no recorded revision"), ("f" * 40, "is no longer in the repository"),
+])
+def test_unknown_revision_rebuilds_in_full(conn, repo, recorded, note):
+    name = register(conn, repo)
+    first = ingest.ingest(conn, name, ENV)
+    with conn.cursor() as cur:
+        cur.execute("update ccctx_repos set indexed_commit = :c where name = :n", c=recorded, n=name)
+    conn.commit()
+    s = ingest.ingest(conn, name, ENV)  # FR-010
+    assert s.mode == "full" and note in s.note and s.symbols == first.symbols
+    assert revision(conn, name) == (head(repo), False)
+
+
+def test_edited_file_keeps_its_unchanged_symbols(conn, repo):
+    name = register(conn, repo)
+    ingest.ingest(conn, name, ENV)
+    before = {r[3]: r for r in stored(conn, name) if r[0] == "app.py"}
+    ids = named_ids(conn, name, "app.py")
+    git(repo, "checkout", "-q", "-b", "edit")
+    edited = APP_PY.replace("import os\n", "import os\nimport sys\n\n\ndef top():\n    pass\n")
+    edited = edited.replace("return x + 1", "return x + 2")
+    (repo / "app.py").write_text(edited, encoding="utf-8", newline="\n")
+    git(repo, "commit", "-q", "-am", "edit")
+    s = ingest.ingest(conn, name, ENV)
+    after = {r[3]: r for r in stored(conn, name) if r[0] == "app.py"}
+    assert s.symbols == 2  # `top` is new and `helper` changed; Service and Service.run only moved
+    assert after["Service"][5:7] == (before["Service"][5] + 5, before["Service"][6] + 5)
+    assert after["Service"][9] == head(repo)  # its lines were read at the new revision
+    now = named_ids(conn, name, "app.py")
+    assert (now["Service"], now["Service.run"]) == (ids["Service"], ids["Service.run"])
+    assert now["helper"] != ids["helper"]
+    assert_matches_full(conn, name)

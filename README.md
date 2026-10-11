@@ -82,7 +82,7 @@ Exit codes: `0` ok, `1` refused input or a missing setting, `2` the database is 
 
 ## Ingesting a codebase
 
-`ccctx ingest <name>` indexes a registered git repository as it is on disk and replaces whatever was indexed before. It needs the embedding model and the hybrid index (see [Searching code](#searching-code)) and refuses to run without it. Each run prints a summary:
+`ccctx ingest <name>` indexes a registered git repository as it is on disk. It needs the embedding model and the hybrid index (see [Searching code](#searching-code)) and refuses to run without it. The first ingest indexes everything and prints a summary:
 
 ```sh
 uv run ccctx ingest flask
@@ -91,11 +91,30 @@ uv run ccctx ingest flask
 ```text
 Scanned   236 files
 Skipped     5 files (5 binary)
-Indexed 1,353 symbols in 125.4s
+Indexed 1,353 symbols in 653.3s
 Fallback  148 files as line windows (148 no grammar, 0 parse errors)
 ```
 
-Most of that time is the database embedding every symbol for the hybrid index when the ingest commits.
+Almost all of that time is the database embedding every symbol for the hybrid index when the ingest commits. On the Free edition container this is CPU-limited, about half a second per symbol.
+
+Later ingests only do the work the changes require. Each repository records the commit it was last indexed at. The next ingest asks git what differs from that commit, adds untracked files and paths that have gone, and compares each file's content hash with what is stored. Only added and changed files are parsed again, and inside a changed file only the functions and classes whose code changed are embedded again: the rest keep their rows and just move to their new lines. Files that were deleted, renamed away, newly ignored, or now too large or binary lose their symbols, so no search result can point at code that is no longer there. Everything else is left alone.
+
+```text
+Changed     9 files (2 added, 6 changed, 1 removed)
+Unchanged 227 files
+Skipped     0 files
+Indexed    84 symbols in 6.3s
+```
+
+A rename counts as one file removed and one added. `Skipped` and `Fallback` count only the files that run read. When nothing changed:
+
+```text
+flask is already up to date at d086db856be1; run with --full to re-index anyway
+```
+
+`ccctx ingest <name> --full` throws the repository's index away and rebuilds it, like the first ingest. Use it after changing `CCCTX_VENDOR_DIRS` or `CCCTX_MAX_FILE_BYTES`, or after an upgrade that changes how code is chunked: an incremental run only looks at files whose content changed, so it will not re-apply new rules to the rest. Ingest also rebuilds in full on its own, with a note on stderr, when no revision is recorded (a repository indexed before this feature) or when the recorded commit no longer exists (history rewritten, or the clone replaced).
+
+A failed ingest changes nothing: the index and the recorded commit stay as they were.
 
 How files are chosen:
 
@@ -104,7 +123,7 @@ How files are chosen:
 - **Too large**: files over `CCCTX_MAX_FILE_BYTES`, default 1048576.
 - **Binary**: files that contain a NUL byte or are not valid UTF-8.
 
-Python, Go and JavaScript files are cut into one chunk per function, method and class (in Go, also struct and interface types). Each chunk has its exact line range, decorators included, and methods are named `Type.method`. Other text files, and code with a syntax error, are cut into 60-line windows that overlap by 10 lines, with kind `chunk`. Every symbol records the commit the repository was at. A working tree with uncommitted changes is indexed as it is on disk, and a warning is printed. One JSON record per run goes to stderr.
+Python, Go and JavaScript files are cut into one chunk per function, method and class (in Go, also struct and interface types). Each chunk has its exact line range, decorators included, and methods are named `Type.method`. Other text files, and code with a syntax error, are cut into 60-line windows that overlap by 10 lines, with kind `chunk`. Every symbol records the commit the repository was at when its file was last read. A working tree with uncommitted changes is indexed as it is on disk, and a warning is printed. One JSON record per run goes to stderr, with the mode (`full`, `incremental` or `current`) and the added, changed, removed and unchanged counts.
 
 Ingestion only reads files. Git runs with the repository's fsmonitor and hooks disabled, so nothing inside the repository is executed.
 
@@ -246,7 +265,7 @@ src/golestan_code_mcp/    config, db check, sample cloner, MCP server
   schema.py               ordered, re-runnable migrations
   registry.py             register and list repositories (shared by CLI and MCP)
   chunker.py              tree-sitter chunks for Python, Go, JavaScript; line-window fallback
-  ingest.py               list files with read-only git, skip rules, store one repository's index
+  ingest.py               list files with read-only git, skip rules, full or incremental re-index of one repository
   semantic.py             model and hybrid index setup, hybrid / text / vector search
   cli.py                  the ccctx command
 tests/                    pytest suite and chunker fixtures

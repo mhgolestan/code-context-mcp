@@ -79,6 +79,13 @@ MIGRATIONS: list[tuple[int, str, list[str]]] = [
         "alter table ccctx_symbols add (search_text clob)",
         BACKFILL_SEARCH_TEXT,
     ]),
+    # The revision each repository was last indexed at, set in the ingest transaction. NULL means rebuild in full.
+    (5, "repo indexed revision", [
+        ("alter table ccctx_repos add (indexed_commit varchar2(64), indexed_dirty boolean,"
+         " indexed_at timestamp with time zone)"),
+        """alter table ccctx_repos add constraint ccctx_repos_indexed_ck
+          check (indexed_commit is null or regexp_like(indexed_commit, '^[0-9a-f]{40}([0-9a-f]{24})?$'))""",
+    ]),
 ]
 
 

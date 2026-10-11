@@ -24,6 +24,10 @@ def format_table(header: tuple[str, ...], rows: list[tuple], numeric: frozenset[
 
 
 def format_summary(s: ingest.Summary) -> str:
+    if s.mode == "current":
+        return f"{s.repo} is already up to date at {s.commit[:12]}; run with --full to re-index anyway"
+    if s.mode == "incremental":
+        return _format_incremental(s)
     skipped = sum(s.skipped.values())
     width = max(len(f"{n:,}") for n in (s.scanned, skipped, s.symbols))
     reasons = ", ".join(f"{s.skipped[r]} {r}" for r in SKIP_ORDER if s.skipped[r])
@@ -40,6 +44,22 @@ def format_summary(s: ingest.Summary) -> str:
     return "\n".join(lines)
 
 
+def _format_incremental(s: ingest.Summary) -> str:
+    reasons = ", ".join(f"{s.skipped[r]} {r}" for r in SKIP_ORDER if s.skipped[r])
+    rows = [
+        ("Changed", s.added + s.changed + s.removed,
+         f" files ({s.added} added, {s.changed} changed, {s.removed} removed)"),
+        ("Unchanged", s.unchanged, " files"),
+        ("Skipped", sum(s.skipped.values()), " files" + (f" ({reasons})" if reasons else "")),
+        ("Indexed", s.symbols, f" symbols in {s.seconds:.1f}s"),
+    ]
+    if s.no_grammar or s.parse_errors:
+        rows.append(("Fallback", s.no_grammar + s.parse_errors,
+                     f" files as line windows ({s.no_grammar} no grammar, {s.parse_errors} parse errors)"))
+    width = max(len(f"{n:,}") for _, n, _ in rows)
+    return "\n".join(f"{label:<9} {n:>{width},}{rest}" for label, n, rest in rows)
+
+
 def _repo_add(conn, args) -> str:
     repo = registry.add_repo(conn, args.path, args.name)
     return f"registered {repo.name} {repo.path}"
@@ -54,8 +74,10 @@ def _repo_list(conn, args) -> str:
 
 
 def _ingest(conn, args) -> str:
-    summary = ingest.ingest(conn, args.name)
-    if summary.dirty:
+    summary = ingest.ingest(conn, args.name, full=args.full)
+    if summary.note:
+        print(f"note: {summary.note}", file=sys.stderr)
+    if summary.dirty and summary.mode != "current":
         print("warning: working tree has uncommitted changes; indexed the files as they are on disk", file=sys.stderr)
     return format_summary(summary)
 
@@ -147,6 +169,7 @@ def parser() -> argparse.ArgumentParser:
 
     ing = groups.add_parser("ingest", help="index a registered repository")
     ing.add_argument("name")
+    ing.add_argument("--full", action="store_true", help="discard the index and rebuild it from the working tree")
     ing.set_defaults(run=_ingest)
 
     sym = groups.add_parser("symbols", help="list indexed symbols")

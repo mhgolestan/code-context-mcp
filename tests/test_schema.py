@@ -151,3 +151,28 @@ def test_backfill_fills_search_text(conn, repo_id):
         text = cur.execute("select search_text from ccctx_symbols where id = :i", i=symbol_id).fetchone()[0].read()
     conn.rollback()
     assert text == "method f in pkg/mod.py\ndef f(): pass"
+
+
+def test_repo_indexed_revision_columns(conn):
+    with conn.cursor() as cur:
+        cur.execute("select name from ccctx_migrations where version = 5")
+        assert cur.fetchone() == ("repo indexed revision",)
+        cur.execute("select column_name, data_type, nullable from user_tab_columns where table_name = 'CCCTX_REPOS'")
+        columns = {name: (kind, nullable) for name, kind, nullable in cur}
+    assert columns["INDEXED_COMMIT"] == ("VARCHAR2", "Y")
+    assert columns["INDEXED_DIRTY"] == ("BOOLEAN", "Y")
+    assert columns["INDEXED_AT"][1] == "Y" and columns["INDEXED_AT"][0].startswith("TIMESTAMP")
+
+
+@pytest.mark.parametrize("sha", [None, "a" * 40, "0123456789abcdef" * 4])
+def test_indexed_commit_accepts_null_sha1_sha256(conn, repo_id, sha):
+    with conn.cursor() as cur:
+        cur.execute("update ccctx_repos set indexed_commit = :c where id = :i", c=sha, i=repo_id)
+    conn.rollback()
+
+
+@pytest.mark.parametrize("sha", ["abc", "A" * 40, "g" * 40, "a" * 41])
+def test_indexed_commit_rejects_bad_values(conn, repo_id, sha):
+    with conn.cursor() as cur, pytest.raises(oracledb.DatabaseError):
+        cur.execute("update ccctx_repos set indexed_commit = :c where id = :i", c=sha, i=repo_id)
+    conn.rollback()

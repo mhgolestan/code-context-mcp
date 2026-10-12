@@ -469,9 +469,183 @@ def test_mcp_child_process_serves_the_tools_from_any_directory(tmp_path):
             return tools, (await client.call_tool("list_repositories", {})).structuredContent
 
     tools, repos = asyncio.run(session())
-    assert tools == ["search_code", "get_symbol", "find_callers", "find_callees", "impact_of", "list_repositories"]
+    assert tools == ["search_code", "get_symbol", "find_callers", "find_callees", "impact_of", "read_wiki",
+                     "list_repositories"]
     try:
         db.connect(load()).close()
     except Exception:
         return  # without a database the listing above is the whole check
     assert repos["database"] == "reachable", repos["reason"]
+
+
+# --- wiki (009 contracts/cli.md) ------------------------------------------------------------------------------
+
+
+WIKI_PKG = '"""Ledger accounting for the demo."""\n' + "".join(
+    f'\n\ndef post{i}():\n    """Post entry {i}."""\n    return {i}\n' for i in range(10))
+WIKI_USER = "from pkg.core import post0\n\n\ndef use():\n    return post0()\n"
+
+
+def make_wiki_repo(root):
+    (root / "src" / "pkg").mkdir(parents=True)
+    (root / "app").mkdir()
+    (root / "src" / "pkg" / "__init__.py").write_text('"""The demo ledger package."""\n')
+    (root / "src" / "pkg" / "core.py").write_text(WIKI_PKG)
+    (root / "app" / "main.py").write_text(WIKI_USER)
+    for args in (["init", "-q"], ["add", "-A"], ["commit", "-q", "-m", "init"]):
+        subprocess.run(["git", "-c", "user.email=t@t", "-c", "user.name=t", *args], cwd=root, check=True,
+                       capture_output=True)
+    return root
+
+
+@pytest.fixture
+def wikirepo(model, capsys, tmp_path):
+    """An ingested repository with one qualifying directory, src/pkg (the page `pkg`), and its wiki built."""
+    n = f"t-{uuid.uuid4().hex[:8]}"
+    root = make_wiki_repo(tmp_path / "w")
+    run(capsys, "repo", "add", str(root), "--name", n)
+    assert run(capsys, "ingest", n)[0] == 0
+    code, out, err = run(capsys, "wiki", "build", "--repo", n)
+    assert code == 0, err
+    return n, root, out, err
+
+
+def test_wiki_build_prints_one_line_per_repository(wikirepo, capsys):
+    n, _, out, err = wikirepo
+    assert re.fullmatch(rf"{n}: 1 pages \(1 added, 0 updated, 0 removed\) in \d+\.\ds\n", out)
+    assert '"event": "wiki"' in err
+    code, out, _ = run(capsys, "wiki", "build", "--repo", n)
+    assert code == 0 and re.fullmatch(rf"{n}: 1 pages \(0 added, 0 updated, 0 removed\) in \d+\.\ds\n", out)
+
+
+def test_wiki_build_notes_when_pages_are_not_searchable(wikirepo, capsys, monkeypatch):
+    from golestan_code_mcp import wiki
+
+    monkeypatch.setattr(wiki, "ensure_index", lambda cur: False)
+    code, _, err = run(capsys, "wiki", "build", "--repo", wikirepo[0])
+    assert code == 0 and "note: wiki pages are not searchable until you run `ccctx model load`" in err
+
+
+def test_wiki_list_columns(wikirepo, capsys):
+    n = wikirepo[0]
+    code, out, _ = run(capsys, "wiki", "list", "--repo", n)
+    header, *rows = out.splitlines()
+    assert code == 0 and header.split() == ["NAME", "REPO", "STATE", "SYMBOLS", "COMPILED", "LAST", "STALE"]
+    assert len(rows) == 1
+    assert re.fullmatch(rf"pkg\s+{n}\s+fresh\s+10\s+\d{{4}}-\d\d-\d\d \d\d:\d\d:\d\d\s+-", rows[0])
+
+
+def test_wiki_list_without_pages(live, capsys, monkeypatch):
+    from golestan_code_mcp import wiki
+
+    monkeypatch.setattr(wiki, "pages", lambda conn, repo=None: [])
+    code, out, _ = run(capsys, "wiki", "list")
+    assert code == 0 and out.strip() == "no wiki pages"
+
+
+def test_wiki_show_prints_the_stored_text_then_sources(wikirepo, capsys):
+    from golestan_code_mcp import wiki
+
+    n = wikirepo[0]
+    with db.connect(load()) as conn:
+        page = wiki.read(conn, "pkg", n)
+    code, out, _ = run(capsys, "wiki", "show", "pkg", "--repo", n)
+    assert code == 0
+    header, _, rest = out.partition("\n")
+    assert re.fullmatch(rf"pkg \({n}, src/pkg\) fresh, compiled \d{{4}}-\d\d-\d\d \d\d:\d\d:\d\d by ccctx-wiki/1",
+                        header)
+    assert page.text.rstrip("\n") in rest
+    sources = rest.split("## Sources\n", 1)[1].splitlines()
+    assert len(sources) == len(page.citations)
+    assert "- `post0` (function, key) src/pkg/core.py:" in rest
+    assert "- `src/pkg/core.py` (file, file)" in rest
+
+
+def test_wiki_citations_table(wikirepo, capsys):
+    n = wikirepo[0]
+    code, out, _ = run(capsys, "wiki", "citations", "pkg", "--repo", n)
+    header, *rows = out.splitlines()
+    assert code == 0 and header.split() == ["NAME", "KIND", "ROLE", "REPO", "PATH", "LINES", "COMPILED", "CURRENT"]
+    key = next(r.split() for r in rows if r.split()[0] == "post0")
+    assert key[1:5] == ["function", "key", n, "src/pkg/core.py"] and re.fullmatch(r"\d+-\d+", key[5])
+    assert len(key[6]) == 12 and key[6] == key[7]
+    file_row = next(r.split() for r in rows if r.split()[0] == "core.py")
+    assert file_row[1:3] == ["file", "file"] and file_row[5] == "-"
+
+
+def test_wiki_refusals_exit_1(wikirepo, capsys, tmp_path):
+    n = wikirepo[0]
+    assert run(capsys, "wiki", "show", "pkg", "--repo", "t-nope") == (1, "", "error: no repository named 't-nope'\n")
+    assert run(capsys, "wiki", "show", "nope", "--repo", n)[2] == f"error: no wiki page named 'nope' in '{n}'\n"
+    empty = f"t-{uuid.uuid4().hex[:8]}"
+    (tmp_path / "e").mkdir()
+    run(capsys, "repo", "add", str(tmp_path / "e"), "--name", empty)
+    code, _, err = run(capsys, "wiki", "build", "--repo", empty)
+    assert code == 1 and err == f"error: repository '{empty}' is not indexed yet; run `ccctx ingest {empty}`\n"
+
+
+def test_wiki_ambiguous_page_needs_repo(wikirepo, capsys, tmp_path):
+    other = f"t-{uuid.uuid4().hex[:8]}"
+    run(capsys, "repo", "add", str(make_wiki_repo(tmp_path / "w2")), "--name", other)
+    run(capsys, "ingest", other)
+    run(capsys, "wiki", "build", "--repo", other)
+    code, _, err = run(capsys, "wiki", "show", "pkg")
+    listed = re.fullmatch(r"error: wiki page 'pkg' is in more than one repository: (.+); pass --repo\n", err)
+    names = listed.group(1).split(", ")  # earlier tests' repositories have a `pkg` page too until teardown
+    assert code == 1 and {wikirepo[0], other} <= set(names) and names == sorted(names)
+
+
+def test_wiki_unreachable_exits_2(capsys, monkeypatch):
+    monkeypatch.setenv("DB_PORT", "1")
+    assert run(capsys, "wiki", "list")[0] == 2
+
+
+def test_ingest_prints_the_pages_it_recompiled(wikirepo, capsys):
+    n, root, _, _ = wikirepo
+    core = root / "src" / "pkg" / "core.py"
+    core.write_text(WIKI_PKG.replace("return 0\n", "return -1\n"))
+    for args in (["add", "-A"], ["commit", "-q", "-m", "tweak"]):
+        subprocess.run(["git", "-c", "user.email=t@t", "-c", "user.name=t", *args], cwd=root, check=True,
+                       capture_output=True)
+    code, out, _ = run(capsys, "ingest", n)
+    lines = out.splitlines()
+    assert code == 0
+    assert re.fullmatch(r"Wiki      pkg stale: \S+ (changed \([0-9a-f]{12} -> [0-9a-f]{12}\)|is gone), recompiled",
+                        lines[-2])
+    assert lines[-1] == "Wiki      1 stale, 1 recompiled, 0 added, 0 removed"
+    assert "fresh" in run(capsys, "wiki", "list", "--repo", n)[1]
+
+
+def test_ingest_summary_wiki_lines():
+    from golestan_code_mcp.wiki import Refresh
+
+    s = replace(summary(), mode="incremental", added=0, changed=1, removed=0, unchanged=3,
+                wiki=Refresh([("flask/json", "dumps changed (5f2c1a9e04b7 -> 9e0d3c1b2a47)")], 1))
+    assert cli.format_summary(s).splitlines()[-2:] == [
+        "Wiki      flask/json stale: dumps changed (5f2c1a9e04b7 -> 9e0d3c1b2a47), recompiled",
+        "Wiki      1 stale, 1 recompiled, 0 added, 0 removed",
+    ]
+    failed = replace(s, wiki=Refresh([("flask/json", "dumps is gone")], error="boom"))
+    assert cli.format_summary(failed).splitlines()[-2] == "Wiki      flask/json stale: dumps is gone, not recompiled"
+    assert cli.format_summary(replace(s, wiki=Refresh([]))).splitlines()[-1] == \
+        "Wiki      0 stale, 0 recompiled, 0 added, 0 removed"
+    assert "Wiki" not in cli.format_summary(replace(s, wiki=None))
+
+
+def test_ingest_warns_when_the_wiki_was_not_recompiled(model, capsys, monkeypatch):
+    from golestan_code_mcp.wiki import Refresh
+
+    s = replace(summary(), mode="incremental", added=0, changed=1, removed=0, unchanged=3,
+                wiki=Refresh([("pkg", "post0 is gone")], error="boom"))
+    monkeypatch.setattr(ingest, "ingest", lambda conn, name, full=False: s)
+    code, _, err = run(capsys, "ingest", "flask")
+    assert code == 0 and "warning: wiki not recompiled: boom" in err
+
+
+def test_search_shows_page_rows(live, capsys, monkeypatch):
+    page = semantic.Result(1, 41.7, 0.63, 1, 1, "flask", "page", "flask/json", "src/flask/json", None, None,
+                           "python", "# flask/json", "stale")
+    monkeypatch.setattr(semantic, "search", lambda *a, **k: [page])
+    code, out, _ = run(capsys, "search", "what does the json module do")
+    row = out.splitlines()[1]
+    assert code == 0 and "page (stale)" in row and row.split()[-1] == "-" and "src/flask/json" in row

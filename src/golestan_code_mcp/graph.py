@@ -59,8 +59,10 @@ def _go_module(modules: set[str], dirs: set[str]) -> str | None:
     return votes.most_common(1)[0][0] if votes else None
 
 
-def _imports(files: dict[int, tuple[str, str]], refs: list[tuple]) -> tuple[dict[int, set[int]], dict[int, set[str]]]:
-    """Per importing file: the files it imports, and the names it binds to a module of this repository."""
+def _imports(files: dict[int, tuple[str, str]], refs: list[tuple]
+             ) -> tuple[dict[int, set[int]], dict[int, set[str]], dict[int, set[str]]]:
+    """Per importing file: the files it imports, the names it binds to a module of this repository, and the outside
+    packages it imports (refs resolving to no file: a Python top-level name or a Go path, never a relative import)."""
     paths = {path: fid for fid, (path, _) in files.items()}
     index = _python_index(paths)
     go_dirs: dict[str, list[int]] = {}
@@ -71,6 +73,7 @@ def _imports(files: dict[int, tuple[str, str]], refs: list[tuple]) -> tuple[dict
 
     imported: dict[int, set[int]] = {}
     modules: dict[int, set[str]] = {}
+    external: dict[int, set[str]] = {}
     for fid, module, level, bound in refs:
         path, language = files[fid]
         found, is_module = [], True
@@ -81,12 +84,31 @@ def _imports(files: dict[int, tuple[str, str]], refs: list[tuple]) -> tuple[dict
         elif language == "javascript":
             target = posixpath.normpath(posixpath.join(posixpath.dirname(path), module))
             found = next(([paths[target + s]] for s in JS_SUFFIXES if target + s in paths), [])
+        if not found and language in ("python", "go") and not level:  # stored JS refs are all relative
+            external.setdefault(fid, set()).add(module.split(".")[0] if language == "python" else module)
         found = [f for f in found if f != fid]
         if found:
             imported.setdefault(fid, set()).update(found)
             if is_module and bound:
                 modules.setdefault(fid, set()).add(bound)
-    return imported, modules
+    return imported, modules, external
+
+
+def _files(cur, r: dict) -> dict[int, tuple[str, str]]:
+    return {fid: (path, language) for fid, path, language in cur.execute(
+        "select id, path, language from ccctx_files where repo_id = :r", r)}
+
+
+def _import_refs(cur, r: dict) -> list[tuple]:
+    return cur.execute(
+        "select i.file_id, i.module, i.rel_level, i.bound from ccctx_import_refs i"
+        " join ccctx_files f on f.id = i.file_id where f.repo_id = :r", r).fetchall()
+
+
+def external_imports(cur, repo_id: int) -> dict[int, set[str]]:
+    """Per file id, the outside packages it imports: its stored import refs that resolve to no indexed file."""
+    r = {"r": repo_id}
+    return _imports(_files(cur, r), _import_refs(cur, r))[2]
 
 
 def _resolve(call: tuple, symbols: dict[int, tuple], by_name: dict[str, list[int]], by_method: dict[str, list[int]],
@@ -112,14 +134,11 @@ def rebuild(cur, repo_id: int) -> None:
     """Delete and rebuild the repository's import and call edges from its stored refs and symbols."""
     # simplified: whole repository rebuilt each ingest, rebuild only the affected names when it shows up in timings
     r = {"r": repo_id}
-    files = {fid: (path, language) for fid, path, language in cur.execute(
-        "select id, path, language from ccctx_files where repo_id = :r", r)}
+    files = _files(cur, r)
     symbols = {sid: (fid, name, kind) for sid, fid, name, kind in cur.execute(
         "select s.id, s.file_id, s.name, s.kind from ccctx_symbols s join ccctx_files f on f.id = s.file_id"
         " where f.repo_id = :r and s.kind <> 'chunk'", r)}
-    import_refs = cur.execute(
-        "select i.file_id, i.module, i.rel_level, i.bound from ccctx_import_refs i"
-        " join ccctx_files f on f.id = i.file_id where f.repo_id = :r", r).fetchall()
+    import_refs = _import_refs(cur, r)
     call_refs = cur.execute(
         "select c.file_id, c.caller_id, c.name, c.form, c.receiver, c.line from ccctx_call_refs c"
         " join ccctx_files f on f.id = c.file_id where f.repo_id = :r", r).fetchall()
@@ -130,7 +149,7 @@ def rebuild(cur, repo_id: int) -> None:
         by_name.setdefault(name, []).append(sid)
         if kind == "method":
             by_method.setdefault(name.rpartition(".")[2], []).append(sid)
-    imported, modules = _imports(files, import_refs)
+    imported, modules, _ = _imports(files, import_refs)
 
     calls, file_calls = [], []
     for call in call_refs:

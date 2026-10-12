@@ -147,6 +147,49 @@ MIGRATIONS: list[tuple[int, str, list[str]]] = [
               source key (file_id) references ccctx_files (id)
               destination key (callee_id) references ccctx_symbols (id) label calls properties (line))""",
     ]),
+    # Docs on files and symbols, and one compiled page per qualifying directory with the records it cites.
+    # The page index is built outside the migration, because it needs the loaded model (research R8).
+    (7, "module wiki", [
+        "alter table ccctx_files add (doc varchar2(1000 char))",
+        "alter table ccctx_symbols add (doc varchar2(1000 char))",
+        "alter table ccctx_repos add (wiki_at timestamp with time zone)",
+        """create table ccctx_wiki_pages (
+          id            number generated always as identity primary key,
+          repo_id       number not null references ccctx_repos (id) on delete cascade,
+          directory     varchar2(1024) not null,
+          name          varchar2(1024) not null,
+          language      varchar2(32)   not null,
+          symbols       number not null,
+          text          clob not null,
+          search_text   clob not null,
+          state         varchar2(8)    not null,
+          compiled_at   timestamp with time zone not null,
+          compiler      varchar2(64)   not null,
+          stale_reason  varchar2(512),
+          constraint ccctx_wiki_pages_dir_uk unique (repo_id, directory),
+          constraint ccctx_wiki_pages_name_uk unique (repo_id, name),
+          constraint ccctx_wiki_pages_symbols_ck check (symbols >= 10),
+          constraint ccctx_wiki_pages_state_ck check (state in ('fresh', 'stale')))""",
+        """create table ccctx_wiki_citations (
+          id            number generated always as identity primary key,
+          page_id       number not null references ccctx_wiki_pages (id) on delete cascade,
+          symbol_id     number references ccctx_symbols (id) on delete set null,
+          file_id       number references ccctx_files (id) on delete set null,
+          role          varchar2(8)    not null,
+          name          varchar2(1024) not null,
+          kind          varchar2(16)   not null,
+          commit_sha    varchar2(64)   not null,
+          content_hash  varchar2(64)   not null,
+          constraint ccctx_wiki_citations_role_ck check (role in ('key', 'calls', 'file', 'depends', 'uses')),
+          constraint ccctx_wiki_citations_target_ck
+            check ((role in ('key', 'calls') and file_id is null)
+                   or (role in ('file', 'depends', 'uses') and symbol_id is null)),
+          constraint ccctx_wiki_citations_commit_ck
+            check (regexp_like(commit_sha, '^[0-9a-f]{40}([0-9a-f]{24})?$')))""",
+        "create index ccctx_wiki_citations_page_ix on ccctx_wiki_citations (page_id)",
+        "create index ccctx_wiki_citations_symbol_ix on ccctx_wiki_citations (symbol_id)",
+        "create index ccctx_wiki_citations_file_ix on ccctx_wiki_citations (file_id)",
+    ]),
 ]
 
 

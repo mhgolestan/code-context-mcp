@@ -1,6 +1,7 @@
 """Chunker: split file text into definition-level chunks with tree-sitter, or into line windows.
 
-The same parse also yields the calls and imports each file makes, for the code graph."""
+The same parse also yields the calls and imports each file makes, for the code graph, and the documentation of
+each definition and of the file, for the module wiki."""
 
 import re
 from collections.abc import Iterator
@@ -57,6 +58,7 @@ class Chunk:
     start_line: int
     end_line: int
     source: str
+    doc: str | None = None  # the first paragraph of its documentation, cleaned (see _clean)
 
 
 class Call(NamedTuple):
@@ -248,21 +250,100 @@ def _js_imports(root: Node) -> Iterator[Import]:
 
 IMPORTS = {"python": _python_imports, "go": _go_imports, "javascript": _js_imports}
 
+DOC_LIMIT = 1000
+UNDERLINE = re.compile(r"^\s*([=\-~^\"'#*+])\1{2,}\s*$")  # an RST heading's underline
+QUOTES = re.compile(r"""^[A-Za-z]*(\"\"\"|'''|"|')|(\"\"\"|'''|"|')$""")
 
-def parse(language: str, text: str) -> tuple[list[Chunk], list[Call], list[Import]] | None:
-    """Definition chunks, calls and imports, or None when there is no grammar or the file does not parse cleanly."""
+
+def _clean(raw: str | None) -> str | None:
+    """The first paragraph of a doc that is not an RST heading, with its whitespace collapsed, at most DOC_LIMIT
+    characters; None if empty. `Tagged JSON` over `~~~~` names a module; the paragraph after it says what it does."""
+    paragraphs, current = [], []
+    for line in [*(raw or "").splitlines(), ""]:
+        if line.strip():
+            current.append(line)
+        elif current:
+            paragraphs.append(current)
+            current = []
+    body = next((p for p in paragraphs if not UNDERLINE.match(p[-1])), paragraphs[0] if paragraphs else [])
+    return " ".join(" ".join(body).split())[:DOC_LIMIT].rstrip() or None
+
+
+def _docstring(block: Node | None) -> str | None:
+    """The string a Python body or module starts with, without its quotes."""
+    first = next((c for c in block.named_children if c.type != "comment"), None) if block else None
+    if first is None or first.type != "expression_statement" or first.named_child_count != 1:
+        return None
+    string = first.named_children[0]
+    return QUOTES.sub("", string.text.decode()) if string.type == "string" else None
+
+
+def _alone(data: bytes, node: Node) -> bool:
+    """Whether only whitespace comes before the node on its first line."""
+    return not data[data.rfind(b"\n", 0, node.start_byte) + 1 : node.start_byte].strip()
+
+
+def _comments_above(node: Node, data: bytes) -> list[Node]:
+    """The run of comments ending on the line just above the node, each on lines of its own, in source order."""
+    run, line, prev = [], node.start_point.row, node.prev_named_sibling
+    while prev is not None and prev.type == "comment" and prev.end_point.row == line - 1 and _alone(data, prev):
+        run.append(prev)
+        line, prev = prev.start_point.row, prev.prev_named_sibling
+    return run[::-1]
+
+
+def _uncomment(comment: str) -> str:
+    if comment.startswith("//"):
+        return comment[2:]
+    body = comment.removeprefix("/*").removesuffix("*/").lstrip("*")  # /* */ and /** */
+    return "\n".join(re.sub(r"^\s*\*", "", line) for line in body.splitlines())
+
+
+def _go_doc(node: Node, data: bytes) -> str | None:
+    """The comments just above, without directives such as //go:build."""
+    return "\n".join(_uncomment(c.text.decode()) for c in _comments_above(node, data)
+                     if not c.text.startswith(b"//go:"))
+
+
+def _js_doc(node: Node, data: bytes) -> str | None:
+    above = _comments_above(node, data)[-1:]
+    return _uncomment(above[0].text.decode()) if above and above[0].text.startswith(b"/**") else None
+
+
+SYMBOL_DOCS = {
+    "python": lambda node, data: _docstring(_definition(node).child_by_field_name("body")),
+    "go": _go_doc,
+    "javascript": _js_doc,
+}
+
+
+def _file_doc(language: str, root: Node, data: bytes) -> str | None:
+    if language == "python":
+        return _docstring(root)
+    if language == "go":
+        package = next((c for c in root.named_children if c.type == "package_clause"), None)
+        return _go_doc(package, data) if package else None
+    return None  # simplified: no JS file docs, read a leading block comment when a JS repository needs it
+
+
+def parse(language: str, text: str) -> tuple[list[Chunk], list[Call], list[Import], str | None] | None:
+    """Definition chunks, calls, imports and the file's doc, or None when there is no grammar or the file does not
+    parse cleanly."""
     if language not in GRAMMARS:
         return None
-    root = _parser(language).parse(text.encode("utf-8")).root_node
+    data = text.encode("utf-8")
+    root = _parser(language).parse(data).root_node
     if root.has_error:
         return None
     lines = text.splitlines()
     chunks, scopes = [], {}
     for name, kind, node in WALKERS[language](root):
         start, end = node.start_point.row + 1, node.end_point.row + 1
-        chunks.append(Chunk(name, kind, start, end, "\n".join(lines[start - 1 : end])))
+        doc = _clean(SYMBOL_DOCS[language](node, data))
+        chunks.append(Chunk(name, kind, start, end, "\n".join(lines[start - 1 : end]), doc))
         scopes[_definition(node).id] = name
-    return chunks, _calls(language, root, scopes), list(IMPORTS[language](root))
+    file_doc = _clean(_file_doc(language, root, data))
+    return chunks, _calls(language, root, scopes), list(IMPORTS[language](root)), file_doc
 
 
 def chunk(language: str, text: str) -> list[Chunk] | None:

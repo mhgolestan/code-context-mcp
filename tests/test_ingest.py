@@ -10,7 +10,7 @@ from collections import Counter
 
 import pytest
 
-from golestan_code_mcp import db, graph, ingest, registry, schema, semantic
+from golestan_code_mcp import db, graph, ingest, registry, schema, semantic, wiki
 from golestan_code_mcp.config import load
 
 ENV = {"CCCTX_MAX_FILE_BYTES": "2048"}
@@ -563,3 +563,167 @@ def test_failed_reread_keeps_the_old_extract_version(conn, graph_repo, monkeypat
     with pytest.raises(RuntimeError):
         ingest.ingest(conn, name, ENV)
     assert extract_version(conn, name) is None and relations(conn, name)["call refs"] == []
+
+
+# --- docs and the module wiki (009) --------------------------------------------------------------------------
+
+DOC_PY = '''"""Module doc."""
+
+
+def documented():
+    """Does a thing."""
+    return 1
+'''
+DOC_GO = '''package main
+
+// Run runs.
+func Run() {
+}
+'''
+
+
+def docs(conn, name):
+    with conn.cursor() as cur:
+        cur.execute("""select f.path, f.doc, s.name, s.doc, s.id from ccctx_files f
+                         join ccctx_repos r on r.id = f.repo_id left join ccctx_symbols s on s.file_id = f.id
+                        where r.name = :n""", n=name)
+        rows = cur.fetchall()
+    return {p: d for p, d, *_ in rows}, {s: (d, i) for _, _, s, d, i in rows if s}
+
+
+def test_docs_are_stored_and_follow_edits(conn, repo):
+    write(repo / "doc.py", DOC_PY)
+    write(repo / "run.go", DOC_GO)
+    git(repo, "add", "-A")
+    git(repo, "commit", "-q", "-m", "docs")
+    name = register(conn, repo)
+    ingest.ingest(conn, name, ENV)
+    files, symbols = docs(conn, name)
+    assert files["doc.py"] == "Module doc." and files["run.go"] is None and files["notes.txt"] is None
+    assert symbols["documented"][0] == "Does a thing." and symbols["Run"][0] == "Run runs."
+    assert symbols["helper"][0] is None and symbols["notes.txt:1-60"][0] is None
+
+    write(repo / "doc.py", DOC_PY.replace("Module doc.", "Edited module doc."))
+    write(repo / "run.go", DOC_GO.replace("// Run runs.", "// Run runs fast."))
+    git(repo, "commit", "-q", "-am", "edit docs")
+    ingest.ingest(conn, name, ENV)
+    files, after = docs(conn, name)
+    assert files["doc.py"] == "Edited module doc."
+    assert after["Run"] == ("Run runs fast.", symbols["Run"][1])  # kept row, new doc
+    assert_matches_full(conn, name)
+
+
+def test_extract_version_1_is_reread_once_without_new_symbols(conn, repo):
+    write(repo / "doc.py", DOC_PY)
+    git(repo, "add", "-A")
+    git(repo, "commit", "-q", "-m", "docs")
+    name = register(conn, repo)
+    first = ingest.ingest(conn, name, ENV)
+    ids = {path: named_ids(conn, name, path) for path in ("app.py", "doc.py")}
+    with conn.cursor() as cur:
+        rid = registry.repo_id(conn, name)
+        cur.execute("update ccctx_repos set extract_version = 1 where id = :r", r=rid)
+        cur.execute("update ccctx_files set doc = null where repo_id = :r", r=rid)
+        cur.execute("update ccctx_symbols set doc = null where file_id in (select id from ccctx_files where repo_id = :r)",
+                    r=rid)
+    conn.commit()
+    assert ingest.EXTRACT_VERSION > 1
+    s = ingest.ingest(conn, name, ENV)
+    assert s.mode == "incremental" and s.changed == first.files and s.symbols == 0
+    assert {path: named_ids(conn, name, path) for path in ids} == ids
+    files, symbols = docs(conn, name)
+    assert files["doc.py"] == "Module doc." and symbols["documented"][0] == "Does a thing."
+    assert extract_version(conn, name) == ingest.EXTRACT_VERSION and ingest.ingest(conn, name, ENV).mode == "current"
+
+
+def pkg_module(prefix):
+    return "".join(f"def {prefix}{i}():\n    return {i}\n\n\n" for i in range(5))
+
+
+@pytest.fixture
+def wiki_repo(tmp_path):
+    """A package of 10 definitions in two files, and an uncited file elsewhere."""
+    root = tmp_path / "wrepo"
+    root.mkdir()
+    git(root, "init", "-q")
+    (root / "pkg").mkdir()
+    (root / "other").mkdir()
+    write(root / "pkg" / "a.py", pkg_module("a"))
+    write(root / "pkg" / "b.py", pkg_module("b"))
+    write(root / "other" / "x.py", "def lonely():\n    return 0\n")
+    git(root, "add", "-A")
+    git(root, "commit", "-q", "-m", "init")
+    return root
+
+
+def pages_of(conn, name):
+    with conn.cursor() as cur:
+        cur.execute("""select p.name, p.state, p.stale_reason from ccctx_wiki_pages p
+                         join ccctx_repos r on r.id = p.repo_id where r.name = :n""", n=name)
+        return {n: (s, why) for n, s, why in cur}
+
+
+def test_editing_a_cited_function_marks_and_recompiles_its_page(conn, wiki_repo):
+    name = register(conn, wiki_repo)
+    old = ingest.ingest(conn, name, ENV).commit
+    wiki.build(conn, name)
+    write(wiki_repo / "pkg" / "a.py", pkg_module("a").replace("return 3", "return 33"))
+    git(wiki_repo, "commit", "-q", "-am", "edit a3")
+    s = ingest.ingest(conn, name, ENV)
+    reason = f"a0 changed ({old[:12]} -> {s.commit[:12]})"  # every symbol of the file moves to the new commit
+    assert s.wiki == wiki.Refresh([("pkg", reason)], 1, 0, 0, None)
+    assert pages_of(conn, name) == {"pkg": ("fresh", reason)}
+    citations = {c.name: c for c in wiki.read(conn, "pkg", name).citations}
+    assert citations["a3"].recorded_commit == s.commit == citations["a3"].current_commit
+
+
+def test_uncited_change_and_no_change_mark_nothing(conn, wiki_repo):
+    name = register(conn, wiki_repo)
+    ingest.ingest(conn, name, ENV)
+    wiki.build(conn, name)
+    write(wiki_repo / "other" / "x.py", "def lonely():\n    return 1\n")
+    git(wiki_repo, "commit", "-q", "-am", "edit uncited")
+    assert ingest.ingest(conn, name, ENV).wiki == wiki.Refresh([], 0, 0, 0, None)
+    assert ingest.ingest(conn, name, ENV).wiki is None  # current: nothing written
+    git(wiki_repo, "revert", "--no-edit", "HEAD")
+    git(wiki_repo, "revert", "--no-edit", "HEAD")
+    s = ingest.ingest(conn, name, ENV)  # a new revision with the same content
+    assert s.mode == "incremental" and s.wiki == wiki.Refresh([], 0, 0, 0, None)
+    assert pages_of(conn, name) == {"pkg": ("fresh", None)}
+
+
+def test_full_reingest_marks_and_recompiles_every_page(conn, wiki_repo):
+    name = register(conn, wiki_repo)
+    ingest.ingest(conn, name, ENV)
+    wiki.build(conn, name)
+    s = ingest.ingest(conn, name, ENV, full=True)
+    assert s.wiki == wiki.Refresh([("pkg", "a0 was re-indexed")], 1, 0, 0, None)
+    assert pages_of(conn, name) == {"pkg": ("fresh", "a0 was re-indexed")}
+    assert all(c.path for c in wiki.read(conn, "pkg", name).citations)
+
+
+def test_without_a_wiki_nothing_is_created(conn, wiki_repo):
+    name = register(conn, wiki_repo)
+    ingest.ingest(conn, name, ENV)
+    write(wiki_repo / "pkg" / "a.py", pkg_module("a").replace("return 3", "return 33"))
+    git(wiki_repo, "commit", "-q", "-am", "edit")
+    assert ingest.ingest(conn, name, ENV).wiki is None
+    assert pages_of(conn, name) == {}
+
+
+def test_failed_recompile_keeps_the_ingestion(conn, wiki_repo, monkeypatch):
+    name = register(conn, wiki_repo)
+    ingest.ingest(conn, name, ENV)
+    wiki.build(conn, name)
+    write(wiki_repo / "pkg" / "b.py", pkg_module("b").replace("return 1", "return 11"))
+    git(wiki_repo, "commit", "-q", "-am", "edit b1")
+
+    def boom(*args, **kwargs):
+        raise RuntimeError("compiler broke")
+
+    monkeypatch.setattr(wiki, "_compile", boom)
+    s = ingest.ingest(conn, name, ENV)
+    assert s.wiki.stale and s.wiki.stale[0][1].startswith("b0 changed") and s.wiki.recompiled == 0
+    assert "compiler broke" in s.wiki.error
+    assert revision(conn, name) == (head(wiki_repo), False)  # the ingestion is committed
+    assert pages_of(conn, name)["pkg"][0] == "stale"

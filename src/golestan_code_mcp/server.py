@@ -3,8 +3,10 @@
 import functools
 import json
 import logging
+import posixpath
 import sys
 import time
+from datetime import UTC
 from typing import Annotated, Literal
 
 import oracledb
@@ -12,7 +14,7 @@ from mcp.server.fastmcp import FastMCP
 from mcp.types import ToolAnnotations
 from pydantic import BaseModel, ConfigDict, Field
 
-from golestan_code_mcp import db, graph, registry, schema, semantic
+from golestan_code_mcp import db, graph, registry, schema, semantic, wiki
 from golestan_code_mcp.config import ConfigError, load
 
 NAME = "golestan_code_mcp"
@@ -36,7 +38,10 @@ def _logged(tool):
             result = tool(*args, **kwargs)
             return result
         finally:
-            items = getattr(result, "results", getattr(result, "repositories", None))
+            items = next((getattr(result, a) for a in ("results", "repositories", "pages") if hasattr(result, a)),
+                         None)
+            if items is not None and getattr(result, "page", None) is not None:
+                items = [result.page]
             log.info(json.dumps({
                 "event": "tool", "tool": tool.__name__, "ms": round((time.monotonic() - started) * 1000),
                 "status": "error" if result is None else getattr(result, "status", None) or result.database,
@@ -45,17 +50,19 @@ def _logged(tool):
     return wrapper
 
 
-def _answer(envelope, check, query):
-    """Refuse bad input before connecting, then answer from the core. Every failure is an unavailable result."""
+def _answer(envelope, check, query, empty=None):
+    """Refuse bad input before connecting, then answer from the core. Every failure is an unavailable result,
+    with the envelope's `empty` fields (no results by default)."""
+    empty = {"results": []} if empty is None else empty
     try:
         check()
         with db.connect(load()) as conn:
             schema.migrate(conn)
             return query(conn)
-    except ValueError as e:  # ConfigError, RegistryError and ModelError are ValueErrors
-        return envelope(status="unavailable", reason=str(e), results=[])
+    except ValueError as e:  # ConfigError, RegistryError, ModelError and WikiError are ValueErrors
+        return envelope(status="unavailable", reason=str(e), **empty)
     except oracledb.Error as e:
-        return envelope(status="unavailable", reason=db.describe(e), results=[])
+        return envelope(status="unavailable", reason=db.describe(e), **empty)
 
 
 def _repos(repo: str | None) -> list[str] | None:
@@ -72,10 +79,11 @@ class SearchHit(BaseModel):
     kind: str
     name: str
     path: str
-    start_line: int
-    end_line: int
+    start_line: int | None
+    end_line: int | None
     language: str
     snippet: str
+    state: Literal["fresh", "stale"] | None = None
 
 
 class SearchResults(BaseModel):
@@ -86,13 +94,16 @@ class SearchResults(BaseModel):
 
 @mcp.tool(
     description="Find code by what it does or by name: \"how are requests routed?\", \"where are sessions saved?\", "
-    "\"url_for\". Use this first when you do not yet know which symbol to look at. If you already know the name, "
-    "use get_symbol to read it, find_callers for its call sites, or impact_of for what a change would affect. "
-    "Returns up to limit hits (default 10), best first. Each hit has the repository, path, symbol name, kind, "
-    "language, line range, a snippet of the symbol's opening lines, and the scores behind its rank: the fused "
-    "score, the keyword rank and the semantic rank (null when that side did not find it). Keyword and semantic "
-    "search are fused, and the definitions of an exact identifier come first. Next step: call get_symbol with a "
-    "hit's name to read its full source.",
+    "\"url_for\". Use this first when you do not yet know which symbol to look at. If you already know the "
+    "name, use get_symbol to read it, find_callers for its call sites, or impact_of for what a change would "
+    "affect. Returns up to limit hits (default 10), best first. Each hit has the repository, path, symbol "
+    "name, kind, language, line range, a snippet of the symbol's opening lines, and the scores behind its "
+    "rank: the fused score, the keyword rank and the semantic rank (null when that side did not find it). "
+    "Keyword and semantic search are fused, and the definitions of an exact identifier come first. A hit of "
+    "kind page is a wiki page about a whole module: its name is the page name, its path is the module's "
+    "directory, its line range is null and its state says whether it is fresh or stale; read it with "
+    "read_wiki. Next step: call get_symbol with a hit's name to read its full source, or read_wiki with a "
+    "page hit's name.",
     annotations=READ_ONLY,
 )
 @_logged
@@ -262,6 +273,97 @@ def impact_of(
         graph.check_depth(depth)
 
     return _graph(ImpactResults, ImpactHit, check, lambda conn: graph.impact(conn, name, depth, _repos(repo)))
+
+
+class WikiCitation(BaseModel):
+    name: str
+    kind: str
+    role: Literal["key", "file", "depends", "uses", "calls"]
+    repo: str | None
+    path: str | None
+    start_line: int | None
+    end_line: int | None
+    commit: str
+    current_commit: str | None
+
+
+class WikiPage(BaseModel):
+    name: str
+    repo: str
+    directory: str
+    language: str
+    state: Literal["fresh", "stale"]
+    compiled_at: str
+    compiler: str
+    stale_reason: str | None
+    symbols: int
+    text: str
+    citations: list[WikiCitation]
+    truncated: bool
+
+
+class WikiPageInfo(BaseModel):
+    name: str
+    repo: str
+    state: Literal["fresh", "stale"]
+    summary: str
+
+
+class WikiResults(BaseModel):
+    status: Literal["ok", "unavailable"]
+    reason: str | None
+    page: WikiPage | None = None
+    pages: list[WikiPageInfo] = []
+    truncated: bool = False
+
+
+def _iso(at) -> str:
+    return (at.astimezone(UTC) if at.tzinfo else at).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+@mcp.tool(
+    description="What does this module do? Reads the tool's wiki page about a module (a directory of indexed code): its "
+    "purpose, its key symbols with one line each, the modules it depends on and the modules that use it. Use "
+    "it when a question is about a module as a whole rather than one function, or after search_code returns a"
+    " hit of kind page. Pass page to read one page; it returns the text, whether it is fresh or stale (and "
+    "what made it stale), when and by what it was compiled, and its citations, each with the repository, path"
+    " and line range of the symbol or file it names. Omit page to list the pages, optionally for one repo, "
+    "with each page's name, state and first purpose line. A stale page describes code that has changed since;"
+    " check its citations. Next step: get_symbol on a key symbol to read its source.",
+    annotations=READ_ONLY,
+)
+@_logged
+def read_wiki(
+    page: Annotated[str | None, Field(description="The page name, for example flask/json, as returned by "
+                                      "search_code or by listing. Case-sensitive. Default: list the pages "
+                                      "instead.")] = None,
+    repo: Annotated[str | None, Field(description="Look only in this registered repository, for example flask. "
+                                      "list_repositories gives the valid names. Needed when two repositories "
+                                      "have a page of the same name. Default: all repositories.")] = None,
+) -> WikiResults:
+    def check():
+        if page is not None and not page.strip():
+            raise ValueError("the page name is empty")
+
+    def query(conn):
+        if page is None:
+            found = wiki.pages(conn, repo)
+            return WikiResults(status="ok", reason=None, truncated=len(found) > LIMIT, pages=[
+                WikiPageInfo(name=p.name, repo=p.repo, state=p.state, summary=p.summary) for p in found[:LIMIT]])
+        try:
+            p = wiki.read(conn, page, repo)
+        except wiki.WikiError as e:  # the CLI's flag is this tool's parameter
+            raise ValueError(str(e).replace("; pass --repo", "; pass repo")) from None
+        citations = [WikiCitation(name=posixpath.basename(c.name) if c.kind == "file" else c.name, kind=c.kind,
+                                  role=c.role, repo=c.repo, path=c.path, start_line=c.start_line,
+                                  end_line=c.end_line, commit=c.recorded_commit, current_commit=c.current_commit)
+                     for c in p.citations]
+        return WikiResults(status="ok", reason=None, page=WikiPage(
+            name=p.name, repo=p.repo, directory=p.directory, language=p.language, state=p.state,
+            compiled_at=_iso(p.compiled_at), compiler=p.compiler, stale_reason=p.stale_reason, symbols=p.symbols,
+            text=p.text, citations=citations, truncated=p.truncated))
+
+    return _answer(WikiResults, check, query, empty={})
 
 
 class RepoInfo(BaseModel):

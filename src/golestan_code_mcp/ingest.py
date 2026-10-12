@@ -12,18 +12,19 @@ import subprocess
 import time
 from collections import Counter
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path, PurePosixPath
 
 import oracledb
 
-from golestan_code_mcp import chunker, graph, semantic
+from golestan_code_mcp import chunker, graph, semantic, wiki
 from golestan_code_mcp.config import environment, max_file_bytes, vendor_dirs
 from golestan_code_mcp.registry import get_repo
+from golestan_code_mcp.wiki import Refresh
 
 log = logging.getLogger("golestan_code_mcp.ingest")
 
-EXTRACT_VERSION = 1  # the call and import extraction rules; a repository stored under others is re-read
+EXTRACT_VERSION = 3  # the call, import and doc extraction rules; a repository stored under others is re-read
 GIT_SAFE = ["-c", "core.fsmonitor=false", "-c", f"core.hooksPath={os.devnull}", "--no-optional-locks"]
 
 
@@ -48,6 +49,7 @@ class Summary:
     removed: int = 0
     unchanged: int = 0
     note: str | None = None  # why a run without --full rebuilt in full
+    wiki: Refresh | None = None  # the pages this run marked stale and recompiled; None without a wiki
 
     @property
     def scanned(self) -> int:
@@ -123,9 +125,9 @@ def _insert_symbols(cur, rows: list[dict]) -> None:
     cur.setinputsizes(search_text=oracledb.DB_TYPE_CLOB, source=oracledb.DB_TYPE_CLOB)
     # The two LOB binds must come last, or long sources fail with ORA-24816.
     cur.executemany(
-        "insert into ccctx_symbols (file_id, name, kind, start_line, end_line, content_hash, commit_sha,"
+        "insert into ccctx_symbols (file_id, name, kind, start_line, end_line, content_hash, commit_sha, doc,"
         " search_text, source) values (:file_id, :name, :kind, :start_line, :end_line, :content_hash,"
-        " :commit_sha, :search_text, :source)",
+        " :commit_sha, :doc, :search_text, :source)",
         [{k: v for k, v in row.items() if k != "path"}
          | {"search_text": f"{row['kind']} {row['name']} in {row['path']}\n{row['source']}"} for row in rows],
     )
@@ -176,7 +178,7 @@ def _prepare(files: dict[str, str]) -> tuple[list[tuple], int, int]:
                 parse_errors += 1
             else:
                 no_grammar += 1
-            parsed = chunker.windows(PurePosixPath(rel).name, text), [], []
+            parsed = chunker.windows(PurePosixPath(rel).name, text), [], [], None
         prepared.append((rel, language, text, *parsed))
     return prepared, no_grammar, parse_errors
 
@@ -184,7 +186,8 @@ def _prepare(files: dict[str, str]) -> tuple[list[tuple], int, int]:
 def _keep_unchanged(cur, file_id: int, commit: str, rows: list[dict]) -> list[dict]:
     """Keep a changed file's symbols whose code is identical, at their new lines; return the rows to insert.
 
-    A kept symbol keeps its search text, so the hybrid index does not embed it again.
+    A kept symbol keeps its search text, so the hybrid index does not embed it again. Its doc is rewritten,
+    because a Go doc comment sits outside the symbol's source and can change on its own.
     """
     old: dict[tuple, list[int]] = {}
     for sid, name, kind, digest in cur.execute(
@@ -194,15 +197,15 @@ def _keep_unchanged(cur, file_id: int, commit: str, rows: list[dict]) -> list[di
     for row in rows:
         ids = old.get((row["name"], row["kind"], row["content_hash"]))
         if ids:
-            moved.append({"i": ids.pop(), "s": row["start_line"], "e": row["end_line"], "c": commit})
+            moved.append({"i": ids.pop(), "s": row["start_line"], "e": row["end_line"], "c": commit, "d": row["doc"]})
         else:
             new.append(row)
     stale = [{"i": sid} for ids in old.values() for sid in ids]
     if stale:
         cur.executemany("delete from ccctx_symbols where id = :i", stale)
     if moved:
-        cur.executemany("update ccctx_symbols set start_line = :s, end_line = :e, commit_sha = :c where id = :i",
-                        moved)
+        cur.executemany("update ccctx_symbols set start_line = :s, end_line = :e, commit_sha = :c, doc = :d"
+                        " where id = :i", moved)
     return new
 
 
@@ -219,21 +222,22 @@ def _write(cur, repo_id: int, commit: str, dirty: bool, prepared: list[tuple], d
         cur.executemany("delete from ccctx_files where repo_id = :r and path = :p",
                         [{"r": repo_id, "p": rel} for rel in delete])  # symbols go with them (on delete cascade)
     rows, fids = [], {}
-    for rel, language, text, chunks, _, _ in prepared:
+    for rel, language, text, chunks, _, _, doc in prepared:
         file_id = cur.var(int)
         if rel in changed:
-            cur.execute("update ccctx_files set language = :l, content_hash = :h where repo_id = :r and path = :p"
-                        " returning id into :i", r=repo_id, p=rel, l=language, h=_sha(text), i=file_id)
+            cur.execute("update ccctx_files set language = :l, content_hash = :h, doc = :d"
+                        " where repo_id = :r and path = :p returning id into :i",
+                        r=repo_id, p=rel, l=language, h=_sha(text), d=doc, i=file_id)
         else:
             cur.execute(
-                "insert into ccctx_files (repo_id, path, language, content_hash)"
-                " values (:r, :p, :l, :h) returning id into :i",
-                r=repo_id, p=rel, l=language, h=_sha(text), i=file_id,
+                "insert into ccctx_files (repo_id, path, language, content_hash, doc)"
+                " values (:r, :p, :l, :h, :d) returning id into :i",
+                r=repo_id, p=rel, l=language, h=_sha(text), d=doc, i=file_id,
             )
         fid = fids[rel] = file_id.getvalue()[0]
         file_rows = [
             dict(file_id=fid, name=c.name[:512], kind=c.kind, start_line=c.start_line, end_line=c.end_line,
-                 source=c.source, content_hash=_sha(c.source), commit_sha=commit, path=rel)
+                 source=c.source, content_hash=_sha(c.source), commit_sha=commit, doc=c.doc, path=rel)
             for c in chunks
         ]
         rows += _keep_unchanged(cur, fid, commit, file_rows) if rel in changed else file_rows
@@ -255,7 +259,7 @@ def _insert_refs(cur, repo_id: int, prepared: list[tuple], fids: dict[str, int],
         "select s.id, s.file_id, s.name from ccctx_symbols s join ccctx_files f on f.id = s.file_id"
         " where f.repo_id = :r and s.kind <> 'chunk'", r=repo_id)}
     calls, imports = [], []
-    for rel, _, _, _, file_calls, file_imports in prepared:
+    for rel, _, _, _, file_calls, file_imports, _ in prepared:
         fid = fids[rel]
         calls += [{"f": fid, "c": ids.get((fid, c.caller[:512])) if c.caller else None, "n": c.name[:512],
                    "o": c.form, "r": c.receiver and c.receiver[:512], "l": c.line} for c in file_calls]
@@ -309,19 +313,24 @@ def ingest(conn, name: str, env: Mapping[str, str] | None = None, full: bool = F
                 current = not stale and commit == recorded and not files and not removed and bool(was_dirty) == dirty
                 mode = "current" if current else "incremental"
             prepared, no_grammar, parse_errors = _prepare(files)
+            has_wiki = mode != "current" and wiki.enabled(cur, repo_id)
             if mode == "current":
                 conn.rollback()  # nothing to write; releases the lock
                 symbols = 0
             else:
                 symbols = _write(cur, repo_id, commit, dirty, prepared, delete,
                                  set() if delete is None else stored.keys() & files.keys())
+                # in this transaction, so no reader sees the new code beside a page called fresh
+                marked = wiki.mark_stale(cur, repo_id) if has_wiki else []
                 conn.commit()
         except BaseException:
             conn.rollback()
             raise
+    # after the commit and in its own transaction, so a wiki failure cannot cost the ingestion (FR-012)
+    pages = replace(wiki.refresh(conn, repo_id), stale=marked) if has_wiki else None
 
     summary = Summary(name, commit, dirty, skipped, len(files), no_grammar, parse_errors, symbols,
-                      round(time.monotonic() - started, 1), mode, added, changed, len(removed), unchanged, note)
+                      round(time.monotonic() - started, 1), mode, added, changed, len(removed), unchanged, note, pages)
     log.info(json.dumps({
         "event": "ingest", "repo": name, "commit": commit, "dirty": dirty, "scanned": summary.scanned,
         "skipped": dict(skipped), "files": summary.files, "no_grammar": no_grammar,

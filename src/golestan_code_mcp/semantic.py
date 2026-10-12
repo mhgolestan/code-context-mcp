@@ -2,7 +2,8 @@
 
 One hybrid vector index over ccctx_symbols.search_text serves both keyword and semantic matching. The database
 computes every vector with the ONNX model; only the published model file is downloaded, once, and no source
-code or question text ever leaves the database to be embedded.
+code or question text ever leaves the database to be embedded. Wiki pages have their own hybrid index (wiki.INDEX),
+searched with the same request and placed among the symbols by semantic similarity.
 """
 
 import json
@@ -42,6 +43,7 @@ MODEL_FILE = "all_MiniLM_L12_v2.onnx"
 METADATA = '{"function":"embedding","embeddingOutput":"embedding","input":{"input":["DATA"]}}'
 IDENTIFIER = re.compile(r"[A-Za-z_][\w.]*")
 MAX_CANDIDATES = 4000  # widest pool a repository filter may ask for
+PAGE_CANDIDATES = 200  # page index chunks to read: every page of a few repositories
 # Oracle Text operator words: never stemmed ($NOT is a syntax error), only ever searched literally in braces
 RESERVED = {
     "ABOUT", "ACCUM", "AND", "BT", "BTG", "BTI", "BTP", "EQUIV", "FUZZY", "HASPATH", "INPATH", "MDATA", "MINUS",
@@ -63,11 +65,12 @@ class Result:
     repo: str
     kind: str
     name: str
-    path: str
-    start_line: int
-    end_line: int
+    path: str  # a page hit's directory
+    start_line: int | None  # None for a page hit: a page has no lines in the code
+    end_line: int | None
     language: str
     snippet: str  # the opening of the stored source: at most SNIPPET_LINES lines and SNIPPET_CHARS characters
+    state: str | None = None  # a page hit's fresh or stale; None for a symbol
 
 
 def check_limit(limit) -> int:
@@ -135,9 +138,12 @@ def _ensure_lexer(cur) -> None:
 
 def load_model(conn, env: Mapping[str, str]) -> str:
     """Load, record and index the model, skipping whatever is already done. Returns a status line."""
+    from golestan_code_mcp import wiki  # wiki imports this module
+
     with conn.cursor() as cur:
         loaded, dimension, index = _state(cur)
         if loaded and dimension == DIMENSION and index:
+            wiki.ensure_index(cur)  # an index built before the wiki existed gets its page index here
             return f"model {MODEL} already present ({DIMENSION} dimensions)"
         if not loaded:
             data = fetch_model(env).read_bytes()
@@ -162,6 +168,7 @@ def load_model(conn, env: Mapping[str, str]) -> str:
             except oracledb.DatabaseError as e:
                 if getattr(e.args[0], "full_code", "") != "ORA-00955":
                     raise ModelError(f"could not build the hybrid index: {db.describe(e)}") from None
+        wiki.ensure_index(cur)
     return f"model {MODEL} loaded ({DIMENSION} dimensions)"
 
 
@@ -201,6 +208,23 @@ def _symbols(cur, rowids: list[str]) -> dict[str, tuple]:
             chunk,
         )
         found.update({row[0]: (*row[1:-1], _snippet(row[-1])) for row in cur})
+    return found
+
+
+def _page_rows(cur, rowids: list[str]) -> dict[str, tuple]:
+    """rowid -> the _symbols tuple shape for wiki pages: kind 'page', the directory as path, no lines, plus state."""
+    found = {}
+    for i in range(0, len(rowids), 500):
+        chunk = rowids[i:i + 500]
+        binds = ", ".join(f"chartorowid(:{n + 1})" for n in range(len(chunk)))
+        cur.execute(
+            f"""select rowidtochar(p.rowid), r.id, r.name, 'page', p.name, p.directory, null, null, p.language,
+                       dbms_lob.substr(p.text, {SNIPPET_CHARS}, 1), p.state
+                  from ccctx_wiki_pages p join ccctx_repos r on r.id = p.repo_id
+                 where p.rowid in ({binds})""",
+            chunk,
+        )
+        found.update({row[0]: (*row[1:-2], _snippet(row[-2]), row[-1]) for row in cur})
     return found
 
 
@@ -255,16 +279,36 @@ def search(conn, question: str, repos: list[str] | None = None, mode: str = "hyb
     with conn.cursor() as cur:
         hits, symbols = _candidates(cur, request, in_scope if scoped else None, limit)
         definitions = _definitions(cur, question) if mode != "vector" and IDENTIFIER.fullmatch(question) else {}
+        page_hits, pages = _page_candidates(cur, request)
 
-    # One entry per symbol (its best chunk), in fused order, inside the chosen repositories. Fallback windows
-    # of one file overlap and look alike (a lockfile has dozens), so only a file's best window is kept.
+    fused = _fuse(hits, symbols, in_scope)
+    by_rowid = {f["rowid"]: f for f in fused}
+    first = [by_rowid.get(r) or {"rowid": r, "score": 0.0, "similarity": None, "text": None, "vector": None}
+             for r, d in definitions.items() if in_scope(d)]
+    first.sort(key=lambda f: (f["rowid"] not in by_rowid, -f["score"]))  # found by the search first, then path
+    found = _fuse(page_hits, pages, in_scope)
+    named = [f for f in found if names_module(question, pages[f["rowid"]][3])]  # "the json module": its page first
+    rest = _place([f for f in fused if f["rowid"] not in definitions], [f for f in found if f not in named])
+    rest = sorted(named, key=lambda f: -(f["similarity"] or -1)) + rest
+    rows = symbols | definitions | pages
+    return [
+        Result(rank, f["score"], f["similarity"], f["text"], f["vector"], *rows[f["rowid"]][1:])
+        for rank, f in enumerate((first + rest)[:limit], 1)
+    ]
+
+
+def _fuse(hits: list[dict], rows: dict[str, tuple], in_scope) -> list[dict]:
+    """One entry per row (its best chunk), in fused order, inside the scope, ranked among the rows kept.
+
+    Fallback windows of one file overlap and look alike (a lockfile has dozens), so only a file's best window is kept.
+    """
     fused, seen = [], set()
     for h in hits:
         rowid = h["rowid"]
-        if rowid in seen or rowid not in symbols or not in_scope(symbols[rowid]):
+        if rowid in seen or rowid not in rows or not in_scope(rows[rowid]):
             continue
         seen.add(rowid)
-        rid, _, kind, _, path, *_ = symbols[rowid]
+        rid, _, kind, _, path, *_ = rows[rowid]
         if kind == "chunk":
             if (rid, path) in seen:
                 continue
@@ -277,20 +321,51 @@ def search(conn, question: str, repos: list[str] | None = None, mode: str = "hyb
         fused.append({"rowid": rowid, "score": float(h["score"]), "similarity": similarity,
                       "text": h["text_rank"] if h.get("text_score") else None,
                       "vector": h["vector_rank"] if h.get("vector_score") else None})
-    for side in ("text", "vector"):  # ranks among the symbols searched, not across the whole index
+    for side in ("text", "vector"):  # ranks among the rows searched, not across the whole index
         for n, f in enumerate(sorted((f for f in fused if f[side]), key=lambda f: f[side]), 1):
             f[side] = n
+    return fused
 
-    by_rowid = {f["rowid"]: f for f in fused}
-    first = [by_rowid.get(r) or {"rowid": r, "score": 0.0, "similarity": None, "text": None, "vector": None}
-             for r, d in definitions.items() if in_scope(d)]
-    first.sort(key=lambda f: (f["rowid"] not in by_rowid, -f["score"]))  # found by the search first, then path
-    ordered = (first + [f for f in fused if f["rowid"] not in definitions])[:limit]
 
-    return [
-        Result(rank, f["score"], f["similarity"], f["text"], f["vector"], *(symbols.get(f["rowid"]) or definitions[f["rowid"]])[1:])
-        for rank, f in enumerate(ordered, 1)
-    ]
+MODULE_WORDS = r"(?:module|package|directory)"
+
+
+def names_module(question: str, page: str) -> bool:
+    """Whether the question names the page's module as one: `the json module`, `package binding`.
+
+    Similarity alone ranked a docs chunk about JSON above the flask/json page (research R8's fallback). A bare
+    mention is not enough: every question about Flask would put the root `flask` page first.
+    """
+    word = re.escape(page.rpartition("/")[2])
+    return bool(re.search(rf"\b{word}\s+{MODULE_WORDS}\b|\b{MODULE_WORDS}\s+{word}\b", question, re.IGNORECASE))
+
+
+def _place(hits: list[dict], pages: list[dict]) -> list[dict]:
+    """Each page above the first hit whose semantic similarity is lower; a page without one goes last.
+
+    The two indexes' fused scores do not compare, but their similarities come from one model (research R8).
+    """
+    placed = list(hits)
+    for page in pages:
+        if page["similarity"] is None:
+            placed.append(page)
+            continue
+        at = next((i for i, h in enumerate(placed)
+                   if h["similarity"] is None or h["similarity"] < page["similarity"]), len(placed))
+        placed.insert(at, page)
+    return placed
+
+
+def _page_candidates(cur, request: dict) -> tuple[list[dict], dict[str, tuple]]:
+    """Page hits for the same request, with their rows. Empty without a page index or anything to ask."""
+    from golestan_code_mcp import wiki  # wiki imports this module
+
+    if "vector" not in request and "text" not in request:
+        return [], {}
+    if not cur.execute("select count(*) from user_indexes where index_name = :i", i=wiki.INDEX).fetchone()[0]:
+        return [], {}
+    hits = _hybrid(cur, request | {"hybrid_index_name": wiki.INDEX, "return": {"topN": PAGE_CANDIDATES}})
+    return hits, _page_rows(cur, list(dict.fromkeys(h["rowid"] for h in hits)))
 
 
 def _candidates(cur, request: dict, in_scope, limit: int) -> tuple[list[dict], dict[str, tuple]]:

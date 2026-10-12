@@ -436,3 +436,68 @@ def test_definitions_refusals(conn, repos, defs):
     for empty in ("", "   "):
         with pytest.raises(ValueError, match="the name is empty"):
             graph.definitions(conn, empty, repos=repos)
+
+
+# --- external imports (009 T004) ----------------------------------------------------------------------------
+
+EXT = {
+    "src/pkg/__init__.py": "",
+    "src/pkg/other.py": "X = 1\n",
+    "src/pkg/mod.py": '''import json
+import werkzeug.http
+from typing import Any
+from . import other
+from .missing import gone
+import pkg.other
+''',
+    "main.go": '''package main
+
+import (
+	"fmt"
+	"net/http"
+	u "example.com/m/util"
+)
+
+func main() {
+	fmt.Println(u.Helper(), http.StatusOK)
+}
+''',
+    "util/a.go": '''package util
+
+import "example.com/m"
+
+func Helper() int {
+	return 1
+}
+''',
+}
+
+
+@pytest.fixture(scope="module")
+def ext(conn, tmp_path_factory):
+    name = f"t-{uuid.uuid4().hex[:8]}"
+    registry.add_repo(conn, make(tmp_path_factory.mktemp("x"), EXT), name)
+    ingest.ingest(conn, name, ENV)
+    return name
+
+
+def test_external_imports_name_what_resolves_to_no_indexed_file(conn, ext):
+    with conn.cursor() as cur:
+        rid = registry.repo_id(conn, ext)
+        paths = dict(cur.execute("select id, path from ccctx_files where repo_id = :r", r=rid).fetchall())
+        found = graph.external_imports(cur, rid)
+    assert {paths[fid]: names for fid, names in found.items() if names} == {
+        # the first dotted component; relative imports (resolved or not) and pkg.other (indexed) never count
+        "src/pkg/mod.py": {"json", "werkzeug", "typing"},
+        # the full import path; the repository's own module path example.com/m... never counts
+        "main.go": {"fmt", "net/http"},
+    }
+
+
+def test_external_imports_of_the_graph_repositories(conn, repos):
+    py, go = repos
+    with conn.cursor() as cur:
+        for name, expected in ((py, {H: {"json"}}), (go, {"main.go": {"fmt"}})):
+            rid = registry.repo_id(conn, name)
+            paths = dict(cur.execute("select id, path from ccctx_files where repo_id = :r", r=rid).fetchall())
+            assert {paths[f]: n for f, n in graph.external_imports(cur, rid).items() if n} == expected

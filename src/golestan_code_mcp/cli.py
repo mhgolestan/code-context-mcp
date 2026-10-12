@@ -2,12 +2,14 @@
 
 import argparse
 import logging
+import posixpath
 import re
 import sys
+from datetime import UTC
 
 import oracledb
 
-from golestan_code_mcp import db, graph, ingest, registry, schema, semantic
+from golestan_code_mcp import db, graph, ingest, registry, schema, semantic, wiki
 from golestan_code_mcp.config import environment, load
 
 SKIP_ORDER = ["ignored", "vendored", "binary", "too large"]
@@ -27,8 +29,18 @@ def format_table(header: tuple[str, ...], rows: list[tuple], numeric: frozenset[
 def format_summary(s: ingest.Summary) -> str:
     if s.mode == "current":
         return f"{s.repo} is already up to date at {s.commit[:12]}; run with --full to re-index anyway"
-    if s.mode == "incremental":
-        return _format_incremental(s)
+    text = _format_incremental(s) if s.mode == "incremental" else _format_full(s)
+    return text if s.wiki is None else "\n".join([text, *_format_wiki(s.wiki)])
+
+
+def _format_wiki(w: wiki.Refresh) -> list[str]:
+    done = "not recompiled" if w.error else "recompiled"
+    return [f"{'Wiki':<9} {page} stale: {reason}, {done}" for page, reason in w.stale] + [
+        (f"{'Wiki':<9} {len(w.stale)} stale, {0 if w.error else w.recompiled} recompiled, {w.added} added,"
+         f" {w.removed} removed")]
+
+
+def _format_full(s: ingest.Summary) -> str:
     skipped = sum(s.skipped.values())
     width = max(len(f"{n:,}") for n in (s.scanned, skipped, s.symbols))
     reasons = ", ".join(f"{s.skipped[r]} {r}" for r in SKIP_ORDER if s.skipped[r])
@@ -80,6 +92,8 @@ def _ingest(conn, args) -> str:
         print(f"note: {summary.note}", file=sys.stderr)
     if summary.dirty and summary.mode != "current":
         print("warning: working tree has uncommitted changes; indexed the files as they are on disk", file=sys.stderr)
+    if summary.wiki and summary.wiki.error:
+        print(f"warning: wiki not recompiled: {summary.wiki.error}", file=sys.stderr)
     return format_summary(summary)
 
 
@@ -138,8 +152,9 @@ def _search(conn, args) -> str:
         if args.mode == "vector":
             return f"no symbols similar enough (similarity >= {semantic.FLOOR:.2f})"
         return "no matching symbols"
-    rows = [(r.rank, f"{r.score:.2f}", _dash(r.keyword_rank), _dash(r.semantic_rank), r.repo, r.kind, r.name, r.path,
-             f"{r.start_line}-{r.end_line}") for r in results]
+    rows = [(r.rank, f"{r.score:.2f}", _dash(r.keyword_rank), _dash(r.semantic_rank), r.repo,
+             f"{r.kind} (stale)" if r.state == "stale" else r.kind, r.name, r.path,
+             "-" if r.start_line is None else f"{r.start_line}-{r.end_line}") for r in results]
     header = ("RANK", "SCORE", "KEYWORD", "SEMANTIC", "REPO", "KIND", "NAME", "PATH", "LINES")
     return format_table(header, rows, frozenset({0, 1, 2, 3}))
 
@@ -169,6 +184,55 @@ def _impact(conn, args) -> str:
 
 
 GRAPH = (_callers, _calls, _impact)
+
+
+def _when(at) -> str:
+    """A compile time in UTC, YYYY-MM-DD HH:MM:SS."""
+    return (at.astimezone(UTC) if at.tzinfo else at).strftime("%Y-%m-%d %H:%M:%S")
+
+
+def _wiki_build(conn, args) -> str:
+    built = wiki.build(conn, args.repo)
+    with conn.cursor() as cur:
+        if not wiki.ensure_index(cur):
+            print("note: wiki pages are not searchable until you run `ccctx model load`", file=sys.stderr)
+    return "\n".join(f"{b.repo}: {b.pages} pages ({b.added} added, {b.updated} updated, {b.removed} removed)"
+                     f" in {b.seconds:.1f}s" for b in built)
+
+
+def _wiki_list(conn, args) -> str:
+    pages = wiki.pages(conn, args.repo)
+    if not pages:
+        return "no wiki pages"
+    rows = [(p.name, p.repo, p.state, p.symbols, _when(p.compiled_at), p.stale_reason or "-") for p in pages]
+    return format_table(("NAME", "REPO", "STATE", "SYMBOLS", "COMPILED", "LAST STALE"), rows, frozenset({3}))
+
+
+def _source(c: wiki.CitationView) -> str:
+    """One Sources line: the citation located through its key, or `gone`."""
+    if c.path is None:
+        where = "gone"
+    elif c.kind == "file":
+        where = ""
+    else:
+        where = f"{c.path}:{c.start_line}-{c.end_line}"
+    return f"- `{c.name}` ({c.kind}, {c.role}) {where}".rstrip()
+
+
+def _wiki_show(conn, args) -> str:
+    p = wiki.read(conn, args.page, args.repo)
+    lines = [f"{p.name} ({p.repo}, {p.directory}) {p.state}, compiled {_when(p.compiled_at)} by {p.compiler}"]
+    if p.state == "stale":
+        lines.append(f"stale: {p.stale_reason}")
+    return "\n".join([*lines, "", p.text.rstrip("\n"), "", "## Sources", *map(_source, p.citations)])
+
+
+def _wiki_citations(conn, args) -> str:
+    p = wiki.read(conn, args.page, args.repo)
+    rows = [(posixpath.basename(c.name) if c.kind == "file" else c.name, c.kind, c.role, c.repo or "-", c.path or "-",
+             "-" if c.start_line is None else f"{c.start_line}-{c.end_line}", c.recorded_commit[:12],
+             (c.current_commit or "gone")[:12] if c.path else "gone") for c in p.citations]
+    return format_table(("NAME", "KIND", "ROLE", "REPO", "PATH", "LINES", "COMPILED", "CURRENT"), rows)
 
 
 def _db_migrate(conn, args) -> str:
@@ -230,6 +294,16 @@ def parser() -> argparse.ArgumentParser:
             g.add_argument("--depth", default="3", help=f"call hops to follow, 1 to {graph.MAX_DEPTH} (default 3)")
         g.set_defaults(run=run)
 
+    wk = groups.add_parser("wiki", help="module pages written from the index").add_subparsers(dest="cmd", required=True)
+    for cmd, run, text in [("build", _wiki_build, "compile the pages of a repository, or of every indexed one"),
+                           ("list", _wiki_list, "list the pages with their state"),
+                           ("show", _wiki_show, "print a page and where each cited symbol is now"),
+                           ("citations", _wiki_citations, "list a page's citations")]:
+        w = wk.add_parser(cmd, help=text)
+        if run in (_wiki_show, _wiki_citations):
+            w.add_argument("page")
+        w.add_argument("--repo")
+        w.set_defaults(run=run)
     model = groups.add_parser("model", help="embedding model").add_subparsers(dest="cmd", required=True)
     model.add_parser("load", help="download once and load the embedding model").set_defaults(run=_model_load)
 
@@ -241,15 +315,19 @@ def parser() -> argparse.ArgumentParser:
 
 
 def main(argv: list[str] | None = None) -> int:
+    for stream in (sys.stdout, sys.stderr):  # a docstring's character the console cannot show must not end the run
+        if hasattr(stream, "reconfigure"):
+            stream.reconfigure(errors="replace")
     args = parser().parse_args(argv)
     if args.group == "mcp":  # before connecting: the server reports an outage per call
         from golestan_code_mcp import server  # only this command needs the MCP library
 
         server.main()
         return 0
-    handler = logging.StreamHandler(sys.stderr)  # the structured ingest record goes to stderr
-    ingest.log.addHandler(handler)
-    ingest.log.setLevel(logging.INFO)
+    handler = logging.StreamHandler(sys.stderr)  # the structured ingest and wiki records go to stderr
+    for log in (ingest.log, wiki.log):
+        log.addHandler(handler)
+        log.setLevel(logging.INFO)
     conn = None
     try:
         if args.run is _repo_add:  # refuse bad input before touching the database

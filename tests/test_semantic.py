@@ -330,3 +330,144 @@ def test_defaults_give_the_same_hits_as_before(conn, repos):
     before = semantic.search(conn, "url_for", [A])
     assert key(semantic.search(conn, "url_for", [A], language=None, limit=semantic.LIMIT)) == key(before)
     assert key(semantic.search(conn, "url_for", [A], language="python")) == key(before)  # all of A is Python
+
+
+# --- wiki pages in search (009 US4, research R8) -------------------------------------------------------------
+
+
+def hit(name, similarity):
+    return {"rowid": name, "similarity": similarity}
+
+
+def test_pages_go_above_the_first_hit_they_beat_on_similarity():
+    rest = [hit("a", 0.8), hit("b", 0.5), hit("c", None)]
+    placed = semantic._place(rest, [hit("p", 0.6), hit("q", 0.9)])
+    assert [h["rowid"] for h in placed] == ["q", "a", "p", "b", "c"]
+
+
+def test_a_page_without_similarity_goes_last():
+    assert [h["rowid"] for h in semantic._place([hit("a", 0.4), hit("b", None)], [hit("p", None)])] == ["a", "b", "p"]
+
+
+D = f"t-{RUN}d"
+LEDGER_TEXT = (
+    "# ledger\n\n"
+    "`ledger` is a Python package of 2 files and 10 definitions: 10 functions.\n"
+    "The ledger module records accounting transactions and keeps the balance of every account.\n\n"
+    "## Key symbols\n"
+    "- `post_entry` (function): Post one transaction to the ledger.\n"
+    "- `balance_of` (function): The balance of an account.\n\n"
+    "## Depends on\n- none\n\n## Used by\n- none\n"
+)
+LEDGER_SYMBOLS = [
+    ("post_entry", "def post_entry(entry):\n    # post one transaction to the ledger\n    return book.append(entry)\n"),
+    ("balance_of", "def balance_of(account):\n    # sum the postings of one account\n    return sum(account.postings)\n"),
+]
+
+
+@pytest.fixture(scope="module")
+def ledger(conn, repos):
+    """Repository D: two Python symbols and a wiki page about its ledger package, in the page index."""
+    from golestan_code_mcp import wiki
+
+    with conn.cursor() as cur:
+        assert wiki.ensure_index(cur)
+        rid = cur.var(int)
+        cur.execute("insert into ccctx_repos (name, path) values (:n, :p) returning id into :i",
+                    n=D, p=f"/tmp/{D}", i=rid)
+        for name, source in LEDGER_SYMBOLS:
+            fid = cur.var(int)
+            cur.execute("insert into ccctx_files (repo_id, path, language, content_hash)"
+                        " values (:r, :p, 'python', :h) returning id into :i",
+                        r=rid.getvalue()[0], p=f"src/ledger/{name}.py", h="0" * 64, i=fid)
+            add_symbol(cur, fid.getvalue()[0], name, "function", f"src/ledger/{name}.py", source)
+        cur.setinputsizes(t=semantic.oracledb.DB_TYPE_CLOB, s=semantic.oracledb.DB_TYPE_CLOB)
+        cur.execute(
+            """insert into ccctx_wiki_pages (repo_id, directory, name, language, symbols, text, search_text, state,
+                                             compiled_at, compiler)
+               values (:r, 'src/ledger', 'ledger', 'python', 10, :t, :s, 'fresh', systimestamp, 'ccctx-wiki/1')""",
+            r=rid.getvalue()[0], t=LEDGER_TEXT, s=f"page ledger in src/ledger\n{LEDGER_TEXT}")
+    conn.commit()
+    return D
+
+
+def test_a_module_question_puts_its_page_first(conn, ledger):
+    results = semantic.search(conn, "what does the ledger module do", [ledger])
+    assert results[0].kind == "page" and results[0].name == "ledger"
+    assert {r.name for r in results[1:]} <= {"post_entry", "balance_of"}
+
+
+def test_a_page_hit_has_its_directory_no_lines_and_its_state(conn, ledger):
+    page = semantic.search(conn, "what does the ledger module do", [ledger])[0]
+    assert (page.repo, page.path, page.start_line, page.end_line) == (ledger, "src/ledger", None, None)
+    assert page.language == "python" and page.state == "fresh"
+    assert page.snippet == "\n".join(LEDGER_TEXT.split("\n")[:10])
+    assert page.similarity is not None and page.score > 0
+
+
+def test_symbol_hits_have_no_state(conn, ledger):
+    assert {r.state for r in semantic.search(conn, "what does the ledger module do", [ledger]) if r.kind != "page"} \
+        <= {None}
+
+
+def test_identifier_definitions_stay_above_pages(conn, ledger):
+    results = semantic.search(conn, "post_entry", [ledger])
+    assert results[0].name == "post_entry" and results[0].kind == "function"
+
+
+def test_repo_and_language_filters_apply_to_pages(conn, ledger):
+    question = "what does the ledger module do"
+    assert all(r.kind != "page" for r in semantic.search(conn, question, [A]))
+    assert all(r.kind != "page" for r in semantic.search(conn, question, [ledger], language="go"))
+    assert semantic.search(conn, question, [ledger], language="python")[0].kind == "page"
+
+
+def test_an_unrelated_question_finds_no_page(conn, ledger):
+    assert all(r.kind != "page" for r in semantic.search(conn, "recipe for sourdough bread", [ledger]))
+
+
+def test_a_stale_page_is_found_as_stale(conn, ledger):
+    with conn.cursor() as cur:
+        cur.execute("update ccctx_wiki_pages set state = 'stale' where name = 'ledger'")
+    conn.commit()
+    try:
+        assert semantic.search(conn, "what does the ledger module do", [ledger])[0].state == "stale"
+    finally:
+        with conn.cursor() as cur:
+            cur.execute("update ccctx_wiki_pages set state = 'fresh' where name = 'ledger'")
+        conn.commit()
+
+
+def test_without_the_page_index_search_returns_symbols_only(conn, ledger, monkeypatch):
+    from golestan_code_mcp import wiki
+
+    monkeypatch.setattr(wiki, "INDEX", "NOT_AN_INDEX")
+    results = semantic.search(conn, "what does the ledger module do", [ledger])
+    assert results and all(r.kind != "page" for r in results)
+
+
+def test_load_model_keeps_the_page_index(conn, ledger):
+    from golestan_code_mcp import wiki
+
+    semantic.load_model(conn, {"CCCTX_MODEL_URL": "http://127.0.0.1:1/x.onnx"})
+    with conn.cursor() as cur:
+        assert cur.execute("select count(*) from user_indexes where index_name = :i", i=wiki.INDEX).fetchone()[0]
+
+
+@pytest.mark.parametrize(("question", "page", "named"), [
+    ("what does the json module do", "flask/json", True),
+    ("what does the binding package do", "binding", True),
+    ("explain package render", "render", True),
+    ("what is in the sansio directory", "flask/sansio", True),
+    ("how does Flask decide which view handles a request", "flask", False),
+    ("how is json encoded", "flask/json", False),
+    ("what does the jsonify module do", "flask/json", False),
+])
+def test_a_question_names_a_module_only_with_module_words(question, page, named):
+    assert semantic.names_module(question, page) is named
+
+
+def test_a_named_module_page_ranks_first_after_definitions(conn, ledger):
+    results = semantic.search(conn, "what does the ledger package do", [ledger])
+    assert results[0].kind == "page"
+    assert semantic.search(conn, "post_entry", [ledger])[0].name == "post_entry"

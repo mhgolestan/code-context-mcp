@@ -148,7 +148,7 @@ class Box:
 
 
 def refs(language: str, text: str) -> tuple[set[tuple], set[tuple]]:
-    _, calls, imports = parse(language, text)
+    _, calls, imports, _ = parse(language, text)
     return {tuple(c) for c in calls}, {tuple(i) for i in imports}
 
 
@@ -224,3 +224,143 @@ def test_javascript_calls_and_imports():
 
 def test_syntax_error_yields_no_calls_or_imports():
     assert parse("python", (FIXTURES / "broken.py").read_text(encoding="utf-8")) is None
+
+
+# --- docs (009 research R2) ----------------------------------------------------------------------------------
+
+
+def docs(language: str, text: str) -> tuple[dict[str, str | None], str | None]:
+    chunks, _, _, file_doc = parse(language, text)
+    return {c.name: c.doc for c in chunks}, file_doc
+
+
+PY_DOCS = '''\
+"""Tools for widgets.
+
+Second paragraph, never stored.
+"""
+import os
+
+
+def documented():
+    """Make   a widget
+    from parts.
+
+    More detail.
+    """
+    return 1
+
+
+def bare():
+    return """not a docstring"""
+
+
+class Box:
+    r\'\'\'A box.\'\'\'
+
+    def open(self):
+        # a comment first
+        "Open it."
+'''
+
+
+def test_python_symbol_and_module_docs():
+    symbols, file_doc = docs("python", PY_DOCS)
+    assert file_doc == "Tools for widgets."
+    assert symbols == {"documented": "Make a widget from parts.", "bare": None, "Box": "A box.",
+                       "Box.open": "Open it."}
+
+
+def test_python_file_without_docstring():
+    assert docs("python", "import os\n\n\ndef f():\n    pass\n") == ({"f": None}, None)
+
+
+GO_DOCS = """\
+// Copyright 2026 someone. Not attached: a blank line follows.
+
+//go:build linux
+// Package server serves widgets.
+//
+// Second paragraph.
+package server
+
+// Server holds the state.
+// It is
+//   shared.
+type Server struct{}
+
+// Not attached: a blank line follows.
+
+func Bare() {}
+
+/* Block doc for Start. */
+func (s *Server) Start() {}
+
+type (
+	// Point is a point.
+	Point struct{}
+	Shape interface{}
+)
+
+var x = 1 // trailing, not a doc
+func After() {}
+"""
+
+
+def test_go_symbol_and_package_docs():
+    symbols, file_doc = docs("go", GO_DOCS)
+    assert file_doc == "Package server serves widgets."
+    assert symbols == {"Server": "Server holds the state. It is shared.", "Bare": None,
+                       "Server.Start": "Block doc for Start.", "Point": "Point is a point.", "Shape": None,
+                       "After": None}
+
+
+def test_go_header_separated_by_a_blank_line_is_not_attached():
+    assert docs("go", "// Copyright header.\n\npackage main\n\nfunc main() {}\n") == ({"main": None}, None)
+
+
+JS_DOCS = """\
+/** File comment, never stored. */
+
+/**
+ * Add two numbers.
+ *
+ * @param a first
+ */
+function add(a, b) {
+  return a + b;
+}
+
+// a line comment is not a doc
+function plain() {}
+
+export class Counter {
+  /** Bump it. */
+  bump() {}
+}
+"""
+
+
+def test_javascript_docs():
+    symbols, file_doc = docs("javascript", JS_DOCS)
+    assert file_doc is None  # simplified: no JS file docs
+    assert symbols == {"add": "Add two numbers.", "plain": None, "Counter": None, "Counter.bump": "Bump it."}
+
+
+def test_doc_is_cut_at_1000_characters():
+    symbols, _ = docs("python", f'def f():\n    """{"word " * 400}"""\n')
+    assert len(symbols["f"]) <= 1000 and symbols["f"].startswith("word word")
+
+
+def test_docs_leave_chunks_unchanged():
+    lines = GO_DOCS.splitlines()
+    for c in parse("go", GO_DOCS)[0]:
+        assert c.source == "\n".join(lines[c.start_line - 1 : c.end_line])
+    assert {(c.name, c.start_line) for c in parse("go", GO_DOCS)[0]} >= {("Server", 12), ("Server.Start", 19)}
+    assert chunk("python", PY_DOCS)[0].source.startswith("def documented")
+
+
+def test_an_rst_heading_is_skipped_for_the_paragraph_after_it():
+    module = '"""\nTagged JSON\n~~~~~~~~~~~\n\nA compact representation for\nnon-standard JSON types.\n"""\n'
+    assert parse("python", module + "def f():\n    pass\n")[3] == "A compact representation for non-standard JSON types."
+    assert parse("python", '"""\nOnly a heading\n==============\n"""\n')[3] == "Only a heading =============="

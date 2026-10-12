@@ -190,11 +190,46 @@ MIGRATIONS: list[tuple[int, str, list[str]]] = [
         "create index ccctx_wiki_citations_symbol_ix on ccctx_wiki_citations (symbol_id)",
         "create index ccctx_wiki_citations_file_ix on ccctx_wiki_citations (file_id)",
     ]),
+    # One row per MCP tool call and the repositories it belongs to; facts live in the memory package's tables,
+    # which its own setup creates here so no table appears outside a migration (specs/010 data-model.md).
+    (8, "agent memory", [
+        """create table ccctx_memory_runs (
+          id            number generated always as identity primary key,
+          called_at     timestamp with time zone default systimestamp not null,
+          tool          varchar2(64)  not null,
+          arguments     json not null,
+          question      varchar2(1000 char),
+          client        varchar2(256),
+          status        varchar2(16)  not null,
+          reason        varchar2(1000 char),
+          ms            number,
+          result_count  number default 0 not null,
+          results       json not null,
+          scoped        boolean default false not null,
+          constraint ccctx_memory_runs_status_ck check (status in ('ok', 'unavailable', 'error')))""",
+        "create index ccctx_memory_runs_called_ix on ccctx_memory_runs (called_at)",
+        """create table ccctx_memory_run_repos (
+          run_id        number not null references ccctx_memory_runs (id) on delete cascade,
+          repo_id       number not null references ccctx_repos (id) on delete cascade,
+          consolidated  boolean default false not null,
+          constraint ccctx_memory_run_repos_pk primary key (run_id, repo_id))""",
+        "create index ccctx_memory_run_repos_repo_ix on ccctx_memory_run_repos (repo_id, consolidated)",
+        lambda cur: _package_schema(cur.connection),
+    ]),
 ]
 
 
-def _run(cur, statement: str | tuple[str, set[str]]) -> None:
-    """Run one migration statement. A (sql, codes) pair also tolerates those codes, for that statement only."""
+def _package_schema(conn) -> None:
+    from golestan_code_mcp import memory  # late: loading schema must not load memory or the package
+
+    memory.create_package_schema(conn)
+
+
+def _run(cur, statement) -> None:
+    """Run one migration statement: SQL, a (sql, codes) pair that also tolerates those codes, or a Python step."""
+    if callable(statement):
+        statement(cur)
+        return
     sql, tolerated = statement if isinstance(statement, tuple) else (statement, set())
     try:
         cur.execute(sql)

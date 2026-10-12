@@ -29,7 +29,11 @@ from golestan_code_mcp.server import mcp
 SPECS = Path(__file__).resolve().parents[1] / "specs"
 CONTRACT = SPECS / "008-mcp-tools" / "contracts" / "tools.md"
 WIKI_CONTRACT = SPECS / "009-module-wiki" / "contracts" / "tools.md"
-TOOLS = ["search_code", "get_symbol", "find_callers", "find_callees", "impact_of", "read_wiki", "list_repositories"]
+MEMORY_CONTRACT = SPECS / "010-agent-memory" / "contracts" / "tools.md"
+TOOLS = ["search_code", "get_symbol", "find_callers", "find_callees", "impact_of", "read_wiki", "list_repositories",
+         "recall"]
+FACT_SENTENCE = ("A hit of kind fact is something an earlier session worked out about the code at its path; recall "
+                 "lists all of them.")
 
 
 async def _session(action):
@@ -52,7 +56,7 @@ def listed():
 
 
 def contract():
-    """The tool and parameter descriptions written in the contracts: step 8's, with step 9's on top."""
+    """The tool and parameter descriptions written in the contracts: step 8's, with steps 9 and 10 on top."""
     text = CONTRACT.read_text(encoding="utf-8")
     wiki_text = WIKI_CONTRACT.read_text(encoding="utf-8")
     tools = dict(re.findall(r"^\*\*`(\w+)`\*\*: (.+)$", text, re.MULTILINE))
@@ -69,10 +73,24 @@ def contract():
         cells = [c.strip() for c in re.split(r"(?<!\\)\|", line)]
         if len(cells) == 5 and cells[1].startswith("`"):
             params[("read_wiki", cells[1].strip("`"))] = cells[3]
+    memory_text = MEMORY_CONTRACT.read_text(encoding="utf-8")
+    tools |= dict(re.findall(r"^\*\*`(recall)`\*\*: (.+)$", memory_text, re.MULTILINE))
+    tools["search_code"] = tools["search_code"].replace("read it with read_wiki.", f"read it with read_wiki. {FACT_SENTENCE}")
+    table = memory_text.split("## `recall`", 1)[1].split("### Parameters", 1)[1].split("Unknown arguments", 1)[0]
+    for line in table.splitlines():
+        cells = [c.strip() for c in re.split(r"(?<!\\)\|", line)]
+        if len(cells) == 5 and cells[1].startswith("`"):
+            params[("recall", cells[1].strip("`"))] = cells[3]
     return tools, params
 
 
-def test_lists_the_seven_tools_as_the_contract_describes_them():
+def instructions():
+    """The server instructions quoted in specs/010-agent-memory/contracts/tools.md."""
+    section = MEMORY_CONTRACT.read_text(encoding="utf-8").split("## Server instructions", 1)[1].split("## ", 1)[0]
+    return " ".join(line[2:].strip() for line in section.splitlines() if line.startswith("> "))
+
+
+def test_lists_the_eight_tools_as_the_contract_describes_them():
     tools = listed()
     assert list(tools) == TOOLS
     descriptions, params = contract()
@@ -91,7 +109,9 @@ def test_lists_the_seven_tools_as_the_contract_describes_them():
         "impact_of": (["name", "depth", "repo"], ["name"]),
         "read_wiki": (["page", "repo"], []),
         "list_repositories": ([], []),
+        "recall": (["repo", "topic", "limit"], []),
     }
+    assert tools["recall"].inputSchema["properties"]["limit"]["default"] == 20
     assert tools["search_code"].inputSchema["properties"]["limit"]["default"] == 10
     assert tools["impact_of"].inputSchema["properties"]["depth"]["default"] == 3
 
@@ -437,3 +457,184 @@ def test_read_wiki_empty_page_refused_before_connecting(monkeypatch):
     monkeypatch.setenv("DB_PORT", "1")
     assert call("read_wiki", page="  ") == {
         "status": "unavailable", "reason": "the page name is empty", "page": None, "pages": [], "truncated": False}
+
+
+# --- recording (specs/010-agent-memory contracts/tools.md "Recording") -----------------------------------------
+
+from mcp.types import Implementation  # noqa: E402
+
+from golestan_code_mcp import memory  # noqa: E402
+
+CLIENT = Implementation(name="test-client", version="9.9")
+
+
+def as_client(tool, **arguments):
+    async def go():
+        async with create_connected_server_and_client_session(mcp, client_info=CLIENT) as client:
+            return await client.call_tool(tool, arguments)
+    return asyncio.run(go())
+
+
+@pytest.fixture
+def recorded(real_recording):
+    """(conn, newest run id before the test). Runs are read back after memory.flush(). Records for real."""
+    try:
+        conn = db.connect(load())
+    except Exception:
+        pytest.skip("database unreachable")
+    schema.migrate(conn)
+    with conn.cursor() as cur:
+        before = cur.execute("select nvl(max(id), 0) from ccctx_memory_runs").fetchone()[0]
+    yield conn, before
+    memory.flush()  # the runs these tests make are artifacts: never let them reach a repository's facts
+    with conn.cursor() as cur:
+        cur.execute("delete from ccctx_memory_runs where id > :b", b=before)
+    conn.commit()
+    conn.close()
+
+
+def runs_since(conn, before):
+    memory.flush()
+    with conn.cursor() as cur:
+        cur.execute("select tool, arguments, question, client, status, reason, result_count from ccctx_memory_runs"
+                    " where id > :b order by id", b=before)
+        return cur.fetchall()
+
+
+MARK = f"zz_{uuid.uuid4().hex[:8]}"
+CALLS = [
+    ("search_code", {"query": f"where is {MARK}"}),
+    ("get_symbol", {"name": MARK}),
+    ("find_callers", {"name": MARK}),
+    ("find_callees", {"name": MARK}),
+    ("impact_of", {"name": MARK, "depth": 2}),
+    ("read_wiki", {}),
+    ("list_repositories", {}),
+    ("recall", {}),
+]
+
+
+@pytest.mark.parametrize(("tool", "arguments"), CALLS)
+def test_every_tool_call_is_one_run(recorded, tool, arguments):
+    conn, before = recorded
+    result = as_client(tool, **arguments)
+    assert not result.isError
+    rows = runs_since(conn, before)
+    assert len(rows) == 1
+    name, args, question, client, status, reason, count = rows[0]
+    assert (name, client) == (tool, "test-client 9.9")
+    assert arguments.items() <= args.items() and None not in args.values()  # the effective call, defaults included
+    assert question == next((arguments[k] for k in ("query", "name", "page", "topic") if k in arguments), None)
+    envelope = result.structuredContent
+    assert status == envelope.get("status", "ok") and reason == envelope.get("reason")
+    assert count == len(next((v for k, v in envelope.items() if k in ("results", "pages", "repositories", "facts")), []))
+
+
+@pytest.mark.parametrize(("tool", "arguments", "reason"), [
+    ("search_code", {"query": ""}, "the question is empty"),
+    ("get_symbol", {"name": "url_for", "repo": "t-nowhere"}, "no repository named 't-nowhere'"),
+])
+def test_refused_calls_are_recorded_unavailable(recorded, tool, arguments, reason):
+    conn, before = recorded
+    as_client(tool, **arguments)
+    [(name, _, _, _, status, why, count)] = runs_since(conn, before)
+    assert (name, status, count) == (tool, "unavailable", 0) and reason in why
+
+
+def test_recording_failure_leaves_the_answer_alone(recorded, monkeypatch, caplog):
+    conn, before = recorded
+    expected = as_client("list_repositories").structuredContent
+    memory.flush()
+
+    def broken(*_):
+        raise RuntimeError("store down")
+
+    monkeypatch.setattr(memory, "store_runs", broken)
+    with caplog.at_level(logging.WARNING, logger="golestan_code_mcp.memory"):
+        assert as_client("list_repositories").structuredContent == expected
+        memory.flush()
+    failures = [json.loads(r.getMessage()) for r in caplog.records if "memory_record_failed" in r.getMessage()]
+    assert failures == [{"event": "memory_record_failed", "tool": "list_repositories", "reason": "store down"}]
+
+
+def test_tool_log_record_is_unchanged(recorded, caplog):
+    with caplog.at_level(logging.INFO, logger="golestan_code_mcp.server"):
+        as_client("list_repositories")
+    records = [json.loads(r.getMessage()) for r in caplog.records if r.name == "golestan_code_mcp.server"]
+    assert records and set(records[-1]) == {"event", "tool", "ms", "status", "results"}
+
+
+# --- recall (specs/010-agent-memory contracts/tools.md) --------------------------------------------------------
+
+
+def test_server_instructions_match_the_contract():
+    assert mcp.instructions == instructions()
+
+
+@pytest.mark.parametrize(("arguments", "reason"), [
+    ({"limit": 0}, "limit must be between 1 and 50"),
+    ({"limit": 51}, "limit must be between 1 and 50"),
+    ({"topic": "  "}, "the topic is empty"),
+])
+def test_recall_refuses_bad_input_before_connecting(monkeypatch, arguments, reason):
+    monkeypatch.setenv("DB_PORT", "1")
+    out = call("recall", **arguments)
+    assert out == {"status": "unavailable", "reason": reason, "facts": [], "runs": [], "total": 0, "truncated": False}
+
+
+def test_recall_database_down(monkeypatch):
+    monkeypatch.setenv("DB_PORT", "1")
+    out = call("recall", repo="flask")
+    assert out["status"] == "unavailable" and out["reason"] and out["facts"] == [] and out["runs"] == []
+
+
+def test_recall_unknown_repository():
+    ready().close()
+    out = call("recall", repo="t-nowhere")
+    assert out["status"] == "unavailable" and out["reason"] == "no repository named 't-nowhere'"
+
+
+def test_recall_matches_core_and_shape(monkeypatch):
+    conn = ready()
+    calls = []
+
+    class Spy:
+        def generate(self, *a, **k):
+            calls.append(a)
+
+    monkeypatch.setattr(memory, "model", lambda env=None: (Spy(), "llm:spy"))
+    with conn:
+        expected = memory.recall(conn, "flask", None, 20)
+    out = call("recall", repo="flask")
+    assert out["status"] == "ok" and out["total"] == expected.total
+    assert out["truncated"] == (expected.total > len(out["facts"]))
+    assert [f["id"] for f in out["facts"]] == [f.id for f in expected.facts]
+    assert [r["id"] for r in out["runs"]] == [r.id for r in expected.runs]
+    assert len(out["runs"]) <= 10 and all(r["tool"] != "recall" for r in out["runs"])
+    for f in out["facts"]:
+        assert set(f) == {"id", "repo", "subject", "kind", "state", "stale_reason", "confidence", "distiller", "text",
+                          "questions", "runs", "updated_at", "sources"}
+        assert len(f["questions"]) <= 5 and len(f["runs"]) <= 20 and f["sources"][0]["role"] == "subject"
+    for r in out["runs"]:
+        assert set(r) == {"id", "at", "tool", "question", "client", "status", "result_count", "top"}
+    assert calls == []  # recall never calls the model
+
+
+def test_recording_adds_no_visible_delay(recorded, monkeypatch):
+    """SC-008: the median of 20 calls with recording is within 5% (plus 10 ms of timer noise) of the median without."""
+    import statistics
+
+    def median_ms():
+        times = []
+        for _ in range(20):
+            started = time.perf_counter()
+            server.get_symbol(name="url_for", repo="flask")
+            times.append(time.perf_counter() - started)
+        return statistics.median(times)
+
+    median_ms()  # warm up the connection path
+    with_recording = median_ms()
+    memory.flush()
+    monkeypatch.setattr(memory, "record", lambda run: None)
+    without = median_ms()
+    assert with_recording <= without * 1.05 + 0.010

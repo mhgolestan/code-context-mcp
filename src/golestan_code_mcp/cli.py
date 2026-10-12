@@ -9,7 +9,7 @@ from datetime import UTC
 
 import oracledb
 
-from golestan_code_mcp import db, graph, ingest, registry, schema, semantic, wiki
+from golestan_code_mcp import db, graph, ingest, memory, registry, schema, semantic, wiki
 from golestan_code_mcp.config import environment, load
 
 SKIP_ORDER = ["ignored", "vendored", "binary", "too large"]
@@ -28,9 +28,21 @@ def format_table(header: tuple[str, ...], rows: list[tuple], numeric: frozenset[
 
 def format_summary(s: ingest.Summary) -> str:
     if s.mode == "current":
-        return f"{s.repo} is already up to date at {s.commit[:12]}; run with --full to re-index anyway"
-    text = _format_incremental(s) if s.mode == "incremental" else _format_full(s)
-    return text if s.wiki is None else "\n".join([text, *_format_wiki(s.wiki)])
+        text = f"{s.repo} is already up to date at {s.commit[:12]}; run with --full to re-index anyway"
+    else:
+        text = _format_incremental(s) if s.mode == "incremental" else _format_full(s)
+        text = text if s.wiki is None else "\n".join([text, *_format_wiki(s.wiki)])
+    return "\n".join([text, *_format_memory(s.memory)])
+
+
+def _format_memory(m: memory.Consolidation | str | None) -> list[str]:
+    """The Memory line: only when consolidation read a run or changed a fact, or failed."""
+    if isinstance(m, str):
+        return [f"{'Memory':<9} not consolidated: {m}"]
+    if m is None or not (m.runs or m.created or m.merged or m.weakened or m.stale or m.reasked):
+        return []
+    return [f"{'Memory':<9} {m.runs} runs read, {m.created} created, {m.merged} merged, {m.weakened} weakened,"
+            f" {m.stale} stale, {m.reasked} re-asked"]
 
 
 def _format_wiki(w: wiki.Refresh) -> list[str]:
@@ -94,6 +106,8 @@ def _ingest(conn, args) -> str:
         print("warning: working tree has uncommitted changes; indexed the files as they are on disk", file=sys.stderr)
     if summary.wiki and summary.wiki.error:
         print(f"warning: wiki not recompiled: {summary.wiki.error}", file=sys.stderr)
+    if isinstance(summary.memory, str):
+        print(f"warning: memory not consolidated: {summary.memory}", file=sys.stderr)
     return format_summary(summary)
 
 
@@ -235,6 +249,62 @@ def _wiki_citations(conn, args) -> str:
     return format_table(("NAME", "KIND", "ROLE", "REPO", "PATH", "LINES", "COMPILED", "CURRENT"), rows)
 
 
+def _top(r: memory.RunView) -> str:
+    """A run's first result as `name location`, or the reason it was not answered."""
+    if r.status != "ok":
+        return r.reason or "-"
+    t = r.top
+    if not t:
+        return "-"
+    if t.get("start_line"):
+        where = f"{t['path']}:{t['start_line']}-{t['end_line']}"
+    elif t.get("line"):
+        where = f"{t['path']}:{t['line']}"
+    else:
+        where = t.get("path", "")
+    return f"{t['name']} {where}".rstrip()
+
+
+def _memory_list(conn, args) -> str:
+    found = memory.runs(conn, args.repo, args.limit)
+    if not found:
+        return "no runs recorded"
+    rows = [(r.id, _when(r.called_at), r.tool, (r.question or "").strip() or "-", r.client or "-", r.status, r.result_count,
+             _top(r))
+            for r in found]
+    return format_table(("RUN", "WHEN", "TOOL", "QUESTION", "CLIENT", "STATUS", "RESULTS", "TOP"), rows,
+                        frozenset({0, 6}))
+
+
+def _distillers(c: memory.Consolidation) -> str:
+    """`template/1` without a model; with one, how many facts each distiller wrote."""
+    if memory.model() is None:
+        return memory.TEMPLATE
+    return ", ".join(f"{k}: {v}" for k, v in sorted(c.distillers.items())) or memory.TEMPLATE
+
+
+def _memory_consolidate(conn, args) -> str:
+    done = memory.consolidate(conn, args.repo)
+    if not done:
+        return "nothing to consolidate"
+    return "\n".join(f"{c.repo}: {c.runs} runs read, {c.created} created, {c.merged} merged, {c.weakened} weakened,"
+                     f" {c.stale} stale, {c.reasked} re-asked in {c.seconds:.1f}s ({_distillers(c)})" for c in done)
+
+
+def _fact_text(f: memory.FactView) -> str:
+    text = f.text if len(f.text) <= 120 else f.text[:119] + "…"
+    return f"{text} (stale: {f.stale_reason})" if f.state == "stale" else text
+
+
+def _memory_facts(conn, args) -> str:
+    found = memory.facts(conn, args.repo, args.limit)
+    if not found:
+        return "no facts"
+    rows = [(f.id[:8], f.repo, f.subject, f"{f.confidence:.3f}", f.state, f.distiller, ",".join(map(str, f.runs)),
+             _fact_text(f)) for f in found]
+    return format_table(("FACT", "REPO", "SUBJECT", "CONFIDENCE", "STATE", "DISTILLER", "RUNS", "TEXT"), rows)
+
+
 def _db_migrate(conn, args) -> str:
     applied = schema.migrate(conn)
     names = {v: n for v, n, _ in schema.MIGRATIONS}
@@ -304,6 +374,19 @@ def parser() -> argparse.ArgumentParser:
             w.add_argument("page")
         w.add_argument("--repo")
         w.set_defaults(run=run)
+    mem = groups.add_parser("memory", help="what the server remembers of tool calls").add_subparsers(
+        dest="cmd", required=True)
+    ml = mem.add_parser("list", help="list recorded tool calls, newest first")
+    ml.add_argument("--repo")
+    ml.add_argument("--limit", type=_positive, default=20)
+    ml.set_defaults(run=_memory_list)
+    mc = mem.add_parser("consolidate", help="distil recorded tool calls into facts")
+    mc.add_argument("--repo")
+    mc.set_defaults(run=_memory_consolidate)
+    mf = mem.add_parser("facts", help="list distilled facts, fresh and most confident first")
+    mf.add_argument("--repo")
+    mf.add_argument("--limit", type=_positive, default=20)
+    mf.set_defaults(run=_memory_facts)
     model = groups.add_parser("model", help="embedding model").add_subparsers(dest="cmd", required=True)
     model.add_parser("load", help="download once and load the embedding model").set_defaults(run=_model_load)
 
@@ -325,7 +408,7 @@ def main(argv: list[str] | None = None) -> int:
         server.main()
         return 0
     handler = logging.StreamHandler(sys.stderr)  # the structured ingest and wiki records go to stderr
-    for log in (ingest.log, wiki.log):
+    for log in (ingest.log, wiki.log, memory.log):
         log.addHandler(handler)
         log.setLevel(logging.INFO)
     conn = None
@@ -361,7 +444,8 @@ def main(argv: list[str] | None = None) -> int:
         print(f"error: {reason}", file=sys.stderr)
         return 2
     finally:
-        ingest.log.removeHandler(handler)
+        for log in (ingest.log, wiki.log, memory.log):
+            log.removeHandler(handler)
     return 0
 
 

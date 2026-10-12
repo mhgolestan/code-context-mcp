@@ -4,8 +4,10 @@ from golestan_code_mcp.config import (
     MODEL_URL,
     PROJECT_ROOT,
     ConfigError,
+    environment,
     load,
     max_file_bytes,
+    memory_model,
     model_cache,
     model_url,
     search_candidates,
@@ -96,3 +98,26 @@ def test_search_settings_defaults_and_overrides():
 def test_bad_search_settings_named(accessor, name, bad):
     with pytest.raises(ConfigError, match=name):
         accessor({name: bad})
+
+
+def test_memory_model_unset_or_blank_means_none():
+    assert memory_model({}) is None
+    assert memory_model({"CCCTX_MEMORY_MODEL": "   "}) is None
+
+
+def test_memory_model_settings_and_hidden_key():
+    m = memory_model({"CCCTX_MEMORY_MODEL": " anthropic/claude-sonnet-5-5 ", "CCCTX_MEMORY_MODEL_BASE": "http://x:1",
+                      "CCCTX_MEMORY_MODEL_KEY": SECRET})
+    assert (m.model, m.base, m.key) == ("anthropic/claude-sonnet-5-5", "http://x:1", SECRET)
+    assert SECRET not in repr(m)
+    bare = memory_model({"CCCTX_MEMORY_MODEL": "ollama/qwen3"})
+    assert (bare.model, bare.base, bare.key) == ("ollama/qwen3", None, None)
+
+
+def test_memory_model_environment_wins_over_dotenv(tmp_path, monkeypatch):
+    dotenv = tmp_path / ".env"
+    dotenv.write_text("CCCTX_MEMORY_MODEL=from/dotenv\n")
+    monkeypatch.delenv("CCCTX_MEMORY_MODEL", raising=False)
+    assert memory_model(environment(dotenv)).model == "from/dotenv"
+    monkeypatch.setenv("CCCTX_MEMORY_MODEL", "from/env")
+    assert memory_model(environment(dotenv)).model == "from/env"

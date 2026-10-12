@@ -1,6 +1,6 @@
 [project]
 name = "golestan-code-mcp"
-version = "1.1.0"
+version = "1.2.0"
 description = "Code context MCP server backed by Oracle AI Database 26ai"
 readme = "README.md"
 requires-python = ">=3.11"
@@ -12,6 +12,7 @@ dependencies = [
     "tree-sitter-python>=0.25",
     "tree-sitter-go>=0.25",
     "tree-sitter-javascript>=0.25",
+    "oracleagentmemory>=26.8,<27",
 ]
 
 [project.scripts]

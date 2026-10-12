@@ -17,9 +17,10 @@ from pathlib import Path, PurePosixPath
 
 import oracledb
 
-from golestan_code_mcp import chunker, graph, semantic, wiki
+from golestan_code_mcp import chunker, graph, memory, semantic, wiki
 from golestan_code_mcp.config import environment, max_file_bytes, vendor_dirs
 from golestan_code_mcp.registry import get_repo
+from golestan_code_mcp.memory import Consolidation
 from golestan_code_mcp.wiki import Refresh
 
 log = logging.getLogger("golestan_code_mcp.ingest")
@@ -50,6 +51,7 @@ class Summary:
     unchanged: int = 0
     note: str | None = None  # why a run without --full rebuilt in full
     wiki: Refresh | None = None  # the pages this run marked stale and recompiled; None without a wiki
+    memory: Consolidation | str | None = None  # what consolidation did, or why it failed (010 FR-014)
 
     @property
     def scanned(self) -> int:
@@ -328,9 +330,16 @@ def ingest(conn, name: str, env: Mapping[str, str] | None = None, full: bool = F
             raise
     # after the commit and in its own transaction, so a wiki failure cannot cost the ingestion (FR-012)
     pages = replace(wiki.refresh(conn, repo_id), stale=marked) if has_wiki else None
+    # every ingestion consolidates, after its commit and on its own, so a failure cannot cost the ingestion
+    try:
+        remembered = memory.consolidate(conn, name, env)[0]
+    except Exception as e:  # noqa: BLE001 - reported in the summary, never raised
+        conn.rollback()
+        remembered = str(e) or type(e).__name__
 
     summary = Summary(name, commit, dirty, skipped, len(files), no_grammar, parse_errors, symbols,
-                      round(time.monotonic() - started, 1), mode, added, changed, len(removed), unchanged, note, pages)
+                      round(time.monotonic() - started, 1), mode, added, changed, len(removed), unchanged, note, pages,
+                      remembered)
     log.info(json.dumps({
         "event": "ingest", "repo": name, "commit": commit, "dirty": dirty, "scanned": summary.scanned,
         "skipped": dict(skipped), "files": summary.files, "no_grammar": no_grammar,

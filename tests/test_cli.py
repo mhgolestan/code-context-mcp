@@ -470,7 +470,7 @@ def test_mcp_child_process_serves_the_tools_from_any_directory(tmp_path):
 
     tools, repos = asyncio.run(session())
     assert tools == ["search_code", "get_symbol", "find_callers", "find_callees", "impact_of", "read_wiki",
-                     "list_repositories"]
+                     "list_repositories", "recall"]
     try:
         db.connect(load()).close()
     except Exception:
@@ -649,3 +649,129 @@ def test_search_shows_page_rows(live, capsys, monkeypatch):
     code, out, _ = run(capsys, "search", "what does the json module do")
     row = out.splitlines()[1]
     assert code == 0 and "page (stale)" in row and row.split()[-1] == "-" and "src/flask/json" in row
+
+
+# --- ccctx memory list (specs/010-agent-memory contracts/cli.md) ---------------------------------------------
+
+from golestan_code_mcp import memory  # noqa: E402
+
+
+def a_run(tool, question, repo, results=(), status="ok", reason=None, client="test-client 9.9"):
+    arguments = {"query": question, "repo": repo} if question else {}
+    return {"tool": tool, "arguments": arguments, "question": question, "client": client, "status": status,
+            "reason": reason, "ms": 3, "result_count": len(results), "results": list(results), "repos": [repo]}
+
+
+@pytest.fixture
+def remembered(live, capsys, tmp_path):
+    n = f"t-{uuid.uuid4().hex[:8]}"
+    assert run(capsys, "repo", "add", str(tmp_path), "--name", n)[0] == 0
+    with db.connect(load()) as conn:
+        memory.store_runs(conn, [
+            a_run("search_code", "where is url_for", n, [{"kind": "function", "repo": n, "name": "url_for",
+                                                          "path": "src/h.py", "start_line": 188, "end_line": 246}]),
+            a_run("find_callers", "url_for", n, [{"kind": "method", "repo": n, "name": "Flask.go", "path": "app.py",
+                                                  "line": 88, "callee": "url_for"}], client=None),
+            a_run("read_wiki", None, n, [{"kind": "page", "repo": n, "name": "flask/json", "path": "src/flask/json"}]),
+            a_run("get_symbol", "nope", n, status="unavailable", reason="no symbol named 'nope'"),
+        ])
+    return n
+
+
+def test_memory_list_newest_first(remembered, capsys):
+    code, out, _ = run(capsys, "memory", "list", "--repo", remembered)
+    rows = out.splitlines()
+    assert code == 0 and rows[0].split() == ["RUN", "WHEN", "TOOL", "QUESTION", "CLIENT", "STATUS", "RESULTS", "TOP"]
+    tools = [line.split()[3] for line in rows[1:]]
+    assert tools == ["get_symbol", "read_wiki", "find_callers", "search_code"]
+    assert "no symbol named 'nope'" in rows[1] and "unavailable" in rows[1]
+    assert "flask/json src/flask/json" in rows[2] and " - " in rows[2]  # a page's TOP, and no question
+    assert "Flask.go app.py:88" in rows[3] and rows[3].count(" - ") >= 1  # a call line's TOP, and no client
+    assert "url_for src/h.py:188-246" in rows[4] and "test-client 9.9" in rows[4]
+
+
+def test_memory_list_limit_and_empty(remembered, capsys, tmp_path):
+    code, out, _ = run(capsys, "memory", "list", "--repo", remembered, "--limit", "1")
+    assert code == 0 and len(out.splitlines()) == 2
+    other = f"t-{uuid.uuid4().hex[:8]}"
+    run(capsys, "repo", "add", str(tmp_path / "x"), "--name", other) if (tmp_path / "x").mkdir() is None else None
+    assert run(capsys, "memory", "list", "--repo", other)[1].strip() == "no runs recorded"
+
+
+def test_memory_list_refusals(live, capsys):
+    code, _, err = run(capsys, "memory", "list", "--repo", "t-nowhere")
+    assert code == 1 and "no repository named 't-nowhere'" in err
+    with pytest.raises(SystemExit) as exit_:
+        cli.main(["memory", "list", "--limit", "0"])
+    assert exit_.value.code == 2
+
+
+def symbol_run(n, question, symbol, path, kind):
+    return a_run("search_code", question, n, [{"kind": kind, "repo": n, "name": symbol, "path": path,
+                                               "start_line": 1, "end_line": 9}])
+
+
+@pytest.fixture
+def distilled(ingested, capsys, monkeypatch):
+    """An ingested repository with three runs about two of its symbols, not yet consolidated."""
+    n, _ = ingested
+    monkeypatch.delenv("CCCTX_MEMORY_MODEL", raising=False)
+    with db.connect(load()) as conn:
+        with conn.cursor() as cur:
+            rows = cur.execute("select s.name, f.path, s.kind from ccctx_symbols s join ccctx_files f on"
+                               " f.id = s.file_id join ccctx_repos r on r.id = f.repo_id where r.name = :n and"
+                               " s.kind in ('function', 'method') order by s.kind, s.name", n=n).fetchall()
+        (first, p1, k1), (second, p2, k2) = rows  # a (function), then B.c (method)
+        memory.store_runs(conn, [symbol_run(n, "where is the first", first, p1, k1),
+                                 symbol_run(n, "where's the first?", first, p1, k1),
+                                 symbol_run(n, "and the second", second, p2, k2)])
+    yield n, first, second
+    with db.connect(load()) as conn:
+        memory.forget(conn, n)
+
+
+def test_memory_consolidate_line_and_rerun(distilled, capsys):
+    n, _, _ = distilled
+    code, out, _ = run(capsys, "memory", "consolidate", "--repo", n)
+    assert code == 0
+    assert re.fullmatch(rf"{n}: 3 runs read, 2 created, 1 merged, 0 weakened, 0 stale, 0 re-asked in \d+\.\ds"
+                        rf" \(template/1\)", out.strip())
+    code, out, _ = run(capsys, "memory", "consolidate", "--repo", n)
+    assert re.fullmatch(rf"{n}: 0 runs read, 0 created, 0 merged, 0 weakened, 0 stale, 0 re-asked in \d+\.\ds"
+                        rf" \(template/1\)", out.strip())
+
+
+def test_memory_facts_table(distilled, capsys):
+    n, first, second = distilled
+    run(capsys, "memory", "consolidate", "--repo", n)
+    code, out, _ = run(capsys, "memory", "facts", "--repo", n)
+    rows = out.splitlines()
+    assert code == 0
+    assert rows[0].split() == ["FACT", "REPO", "SUBJECT", "CONFIDENCE", "STATE", "DISTILLER", "RUNS", "TEXT"]
+    cells = [line.split() for line in rows[1:]]
+    assert [c[2] for c in cells] == [first, second]  # 0.750 before 0.500
+    assert [c[3] for c in cells] == ["0.750", "0.500"] and all(len(c[0]) == 8 for c in cells)
+    assert cells[0][6].count(",") == 1 and cells[0][6].split(",") == sorted(cells[0][6].split(","), key=int)
+    assert all(len(line.split("template/1", 1)[1].split(None, 1)[1]) <= 125 for line in rows[1:])
+
+
+def test_memory_facts_empty_and_refusals(live, capsys, tmp_path):
+    n = f"t-{uuid.uuid4().hex[:8]}"
+    run(capsys, "repo", "add", str(tmp_path), "--name", n)
+    assert run(capsys, "memory", "facts", "--repo", n)[1].strip() == "no facts"
+    for cmd in ("facts", "consolidate"):
+        code, _, err = run(capsys, "memory", cmd, "--repo", "t-nowhere")
+        assert code == 1 and "no repository named 't-nowhere'" in err
+
+
+def test_ingest_summary_memory_line():
+    quiet = memory.Consolidation("r")
+    busy = memory.Consolidation("r", runs=3, created=1, merged=2, stale=1, reasked=2)
+    assert "Memory" not in cli.format_summary(replace(summary(), memory=quiet))
+    assert cli.format_summary(replace(summary(), memory=None)) == cli.format_summary(summary())
+    assert cli.format_summary(replace(summary(), memory=busy)).splitlines()[-1] == (
+        "Memory    3 runs read, 1 created, 2 merged, 0 weakened, 1 stale, 2 re-asked")
+    assert cli.format_summary(replace(summary(), memory="memory down")).splitlines()[-1] == (
+        "Memory    not consolidated: memory down")
+    current = replace(summary(), mode="current", commit="a" * 40, memory=busy)
+    assert cli.format_summary(current).splitlines()[1].startswith("Memory    3 runs read")

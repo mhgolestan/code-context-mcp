@@ -1,6 +1,7 @@
 """golestan_code_mcp stdio MCP server. Logs go to stderr; stdout carries the protocol."""
 
 import functools
+import inspect
 import json
 import logging
 import posixpath
@@ -14,11 +15,16 @@ from mcp.server.fastmcp import FastMCP
 from mcp.types import ToolAnnotations
 from pydantic import BaseModel, ConfigDict, Field
 
-from golestan_code_mcp import db, graph, registry, schema, semantic, wiki
+from golestan_code_mcp import db, graph, memory, registry, schema, semantic, wiki
 from golestan_code_mcp.config import ConfigError, load
 
 NAME = "golestan_code_mcp"
-mcp = FastMCP(NAME)
+INSTRUCTIONS = (
+    "This server indexes codebases and remembers what earlier sessions learned about them. At the start of a session, "
+    "call recall (with the repository if you know it) to load the facts already worked out. Call recall before "
+    "searching for something an earlier session may already have found. Use search_code, get_symbol and the graph "
+    "tools for what recall does not answer.")
+mcp = FastMCP(NAME, instructions=INSTRUCTIONS)
 log = logging.getLogger("golestan_code_mcp.server")
 READ_ONLY = ToolAnnotations(readOnlyHint=True)
 LIMIT = 200  # graph tools return at most this many rows; truncated says when more existed
@@ -29,8 +35,20 @@ Repo = Annotated[str | None, Field(description="Look only in this registered rep
                                    "list_repositories gives the valid names. Default: all repositories.")]
 
 
+def _client() -> str | None:
+    """The calling client's name and version from its handshake, or None outside a session."""
+    try:
+        info = mcp.get_context().session.client_params.clientInfo
+        return f"{info.name} {info.version}"
+    except Exception:  # noqa: BLE001 - no request context (direct calls, tests)
+        return None
+
+
 def _logged(tool):
-    """One structured record per call: tool, latency, status, result count. Never the arguments or results."""
+    """One structured record per call: tool, latency, status, result count, never the arguments or results.
+    Then the call is recorded as a run for agent memory, which can never change or delay the answer (010 FR-003)."""
+    signature = inspect.signature(tool)
+
     @functools.wraps(tool)
     def wrapper(*args, **kwargs):
         started, result = time.monotonic(), None
@@ -38,15 +56,22 @@ def _logged(tool):
             result = tool(*args, **kwargs)
             return result
         finally:
-            items = next((getattr(result, a) for a in ("results", "repositories", "pages") if hasattr(result, a)),
-                         None)
+            ms = round((time.monotonic() - started) * 1000)
+            items = next((getattr(result, a) for a in ("results", "repositories", "pages", "facts")
+                          if hasattr(result, a)), None)
             if items is not None and getattr(result, "page", None) is not None:
                 items = [result.page]
             log.info(json.dumps({
-                "event": "tool", "tool": tool.__name__, "ms": round((time.monotonic() - started) * 1000),
+                "event": "tool", "tool": tool.__name__, "ms": ms,
                 "status": "error" if result is None else getattr(result, "status", None) or result.database,
                 "results": None if items is None else len(items),
             }))
+            try:
+                # FastMCP passes every parameter, defaults included: record the effective call, minus unset ones
+                arguments = {k: v for k, v in signature.bind(*args, **kwargs).arguments.items() if v is not None}
+                memory.record(memory.run_of(tool.__name__, arguments, result, _client(), ms))
+            except Exception:  # noqa: BLE001 - recording must never reach the client
+                log.exception("could not record the run")
     return wrapper
 
 
@@ -102,7 +127,8 @@ class SearchResults(BaseModel):
     "Keyword and semantic search are fused, and the definitions of an exact identifier come first. A hit of "
     "kind page is a wiki page about a whole module: its name is the page name, its path is the module's "
     "directory, its line range is null and its state says whether it is fresh or stale; read it with "
-    "read_wiki. Next step: call get_symbol with a hit's name to read its full source, or read_wiki with a "
+    "read_wiki. A hit of kind fact is something an earlier session worked out about the code at its path; recall "
+    "lists all of them. Next step: call get_symbol with a hit's name to read its full source, or read_wiki with a "
     "page hit's name.",
     annotations=READ_ONLY,
 )
@@ -396,6 +422,89 @@ def list_repositories() -> RepoList:
     except oracledb.Error as e:
         return RepoList(database="unreachable", reason=db.describe(e), repositories=[])
     return RepoList(database="reachable", reason=None, repositories=[RepoInfo(**vars(r)) for r in repos])
+
+
+class RecallSource(BaseModel):
+    role: Literal["subject", "related"]
+    name: str
+    kind: str
+    repo: str
+    path: str | None
+    start_line: int | None
+    end_line: int | None
+
+
+class RecallFact(BaseModel):
+    id: str
+    repo: str
+    subject: str
+    kind: str
+    state: Literal["fresh", "stale"]
+    stale_reason: str | None
+    confidence: float
+    distiller: str
+    text: str
+    questions: list[str]
+    runs: list[int]
+    updated_at: str
+    sources: list[RecallSource]
+
+
+class RecallRun(BaseModel):
+    id: int
+    at: str
+    tool: str
+    question: str | None
+    client: str | None
+    status: str
+    result_count: int
+    top: dict | None
+
+
+class RecallResults(BaseModel):
+    status: Literal["ok", "unavailable"]
+    reason: str | None
+    facts: list[RecallFact] = []
+    runs: list[RecallRun] = []
+    total: int = 0
+    truncated: bool = False
+
+
+@mcp.tool(
+    description="Call this at the start of a session, and before searching, to load what earlier sessions already "
+    "worked out about a codebase. Returns the stored facts, fresh first and most confident first, or most related to "
+    "topic when one is given, and the most recent tool calls. Each fact has its subject (a symbol or wiki page), its "
+    "text, a confidence from 0 to 1, whether it is fresh or stale (and why), what wrote its text (a configured model "
+    "or the template distiller), the IDs of the runs it was distilled from, and the repository, path and line range "
+    "of the code it describes. A stale fact describes code that has changed since; check it with get_symbol before "
+    "relying on it. Facts are distilled from earlier calls by ccctx memory consolidate and after every ingestion. Next "
+    "step: get_symbol on a fact's subject to read its source, or search_code for what recall does not cover.",
+    annotations=READ_ONLY,
+)
+@_logged
+def recall(
+    repo: Annotated[str | None, Field(description="Recall only this registered repository, for example flask. "
+                                      "list_repositories gives the valid names. Default: all repositories.")] = None,
+    topic: Annotated[str | None, Field(description="Put the facts most related to this first, for example "
+                                       "\"sessions\" or \"url_for\". Default: most confident first.")] = None,
+    limit: Annotated[int, Field(description="How many facts to return, 1 to 50. Default 20.")] = 20,
+) -> RecallResults:
+    def check():
+        semantic.check_limit(limit)
+        if topic is not None and not topic.strip():
+            raise ValueError("the topic is empty")
+
+    def query(conn):
+        r = memory.recall(conn, repo, topic, limit)
+        return RecallResults(status="ok", reason=None, total=r.total, truncated=r.total > len(r.facts), facts=[
+            RecallFact(id=f.id, repo=f.repo, subject=f.subject, kind=f.kind, state=f.state, stale_reason=f.stale_reason,
+                       confidence=f.confidence, distiller=f.distiller, text=f.text, questions=f.questions[:5],
+                       runs=f.runs[-20:], updated_at=f.updated_at, sources=[RecallSource(**s) for s in f.sources])
+            for f in r.facts], runs=[
+            RecallRun(id=x.id, at=_iso(x.called_at), tool=x.tool, question=x.question, client=x.client,
+                      status=x.status, result_count=x.result_count, top=x.top) for x in r.runs])
+
+    return _answer(RecallResults, check, query, empty={})
 
 
 # FastMCP drops arguments a tool does not declare. Refuse them instead: a stale `repos` would otherwise widen a

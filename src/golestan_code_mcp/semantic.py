@@ -291,6 +291,14 @@ def search(conn, question: str, repos: list[str] | None = None, mode: str = "hyb
     rest = _place([f for f in fused if f["rowid"] not in definitions], [f for f in found if f not in named])
     rest = sorted(named, key=lambda f: -(f["similarity"] or -1)) + rest
     rows = symbols | definitions | pages
+    if mode != "text":  # fact hits are placed by similarity, like pages, and never above a definition (010 R14)
+        from golestan_code_mcp import memory  # memory imports this module
+
+        facts = memory.search_facts(conn, question, repos, language)
+        rest = _place(rest, [{"rowid": f"fact:{n}", "score": 0.0, "similarity": f["similarity"], "text": None,
+                              "vector": n} for n, f in enumerate(facts, 1)])
+        rows |= {f"fact:{n}": (None, f["repo"], "fact", f["name"], f["path"], f["start_line"], f["end_line"],
+                               f["language"], f["snippet"], "fresh") for n, f in enumerate(facts, 1)}
     return [
         Result(rank, f["score"], f["similarity"], f["text"], f["vector"], *rows[f["rowid"]][1:])
         for rank, f in enumerate((first + rest)[:limit], 1)

@@ -346,6 +346,73 @@ Ingestion stamps every symbol of a changed file with the new commit. So editing 
 
 **Upgrading.** This version stores module docstrings and doc comments, which earlier versions did not. The first ingest of each repository after upgrading re-reads every file to fill them in. Unchanged symbols are kept, so nothing is re-embedded. Then run `ccctx wiki build` once.
 
+## Agent memory
+
+The server remembers what it has been asked, so a new session does not work the same things out again. Memory has
+three layers:
+
+- **Runs.** Every MCP tool call is recorded with its arguments, the client that asked, the status, and the identity
+  and location of each result. A run never holds source code or snippets. Recording happens on a background thread:
+  it never delays or changes an answer, and a failure to record is only logged. CLI commands are not recorded.
+- **Facts.** `ccctx memory consolidate` distils the runs into facts, one per piece of code (a symbol or a wiki page)
+  per repository. Each fact has a subject, its text, a confidence, the IDs of the runs it came from, and references to
+  the code it describes. Facts are stored with Oracle's AI Agent Memory package, in the `ccctx_mem_*` tables that
+  `ccctx db migrate` creates.
+- **Recall.** The `recall` tool hands the facts and the latest runs back. The server tells clients to call it at the
+  start of a session, and fresh facts also show up in `search_code` as hits of kind `fact`.
+
+```sh
+uv run ccctx memory list --repo flask --limit 10   # one row per tool call, newest first
+uv run ccctx memory consolidate --repo flask       # distil the runs not yet consolidated
+uv run ccctx memory facts --repo flask             # fresh first, then by confidence
+```
+
+```text
+flask: 20 runs read, 4 created, 15 merged, 1 weakened, 0 stale, 0 re-asked in 0.4s (template/1)
+```
+
+**Merging.** A run is about the code its first result points at, so two runs merge when they led to the same code,
+however the question was worded: "where is url_for defined" and "where's url_for defined?" give one `url_for` fact
+holding both wordings. A wording that later leads to other code moves to that code's fact, and the two facts are
+linked as contradicting each other.
+
+**Confidence** is `(1 - 0.5^agree) * 0.5^contradict`. One agreeing run gives 0.5, two give 0.75 and three give 0.875,
+and each contradiction halves it. A contradiction is a wording that moved, a finding that changed (for example a
+different caller count), a re-ask answered by other code, or the code being removed.
+
+**Keeping pace with the code.** Every `ccctx ingest` consolidates afterwards and prints a `Memory` line when anything
+happened. Before distilling new runs, each fresh fact is checked against the index:
+
+| The fact's code | What happens |
+|---|---|
+| unchanged | nothing |
+| moved, same content | the fact points at the new place |
+| edited | it is re-asked: the calls it came from run again against the new index (not recorded as runs). If the same code still answers, the fact stays fresh. If other code answers, it goes stale and its confidence halves. |
+| removed | the fact goes stale with `` `X` was removed `` and its confidence halves |
+
+A stale fact is shown as stale everywhere, is left out of search, and becomes fresh again only when a new run
+confirms it. A consolidation failure never undoes an ingestion: the summary says `Memory    not consolidated: <why>`.
+
+**The model that writes fact text (optional).** By default a template writes each fact from what the runs found,
+and nothing leaves the database. To have a language model write the text instead, set `CCCTX_MEMORY_MODEL` to a
+LiteLLM model string, plus its key in `CCCTX_MEMORY_MODEL_KEY` or the provider's usual variable:
+
+```sh
+CCCTX_MEMORY_MODEL=anthropic/claude-sonnet-5-5
+ANTHROPIC_API_KEY=...
+```
+
+For each fact it writes, the model is sent exactly this: the subject's name, kind and path; its source, at most 200
+lines; the findings (where it is defined, its caller, callee and reach counts and names); the names and locations of
+the related symbols; and the question wordings. Nothing else is sent, and search, chunking and embedding never send
+anything. The model only writes the text. Which code a fact is about, merging, confidence and staleness are decided the
+same way with or without it. Its text may name only code that appears in what it was sent; otherwise, and whenever
+the call fails, the template writes the fact. Each fact records which one wrote it (`template/1` or
+`llm:<model>`).
+
+**Removing a repository.** There is no `repo remove` command yet. When one is added, it must call `memory.forget`,
+which deletes the repository's facts. Runs that belonged only to it are deleted by the next consolidation.
+
 ## Checking that data persists
 
 `uv run pytest` adds a row to the `ccctx_smoke` table on each run. Note the count, restart the container, and check it again:
@@ -375,18 +442,24 @@ The editable install keeps `.env` in reach. With a non-editable install there is
 
 | Tool | Parameters | Returns |
 |---|---|---|
-| `search_code` | `query`, `repo`, `language`, `limit` (default 10, 1 to 50) | Hits with repository, path, symbol name, kind, language, line range, a snippet (the first 10 lines, at most 800 characters) and the fused, keyword and semantic scores. The same hits as `ccctx search`, wiki pages included: a page hit has kind `page`, a `state`, its directory as `path` and a null line range. |
+| `search_code` | `query`, `repo`, `language`, `limit` (default 10, 1 to 50) | Hits with repository, path, symbol name, kind, language, line range, a snippet (the first 10 lines, at most 800 characters) and the fused, keyword and semantic scores. The same hits as `ccctx search`, wiki pages included: a page hit has kind `page`, a `state`, its directory as `path` and a null line range. A fact hit has kind `fact`, its subject as the name, the subject's location, and the fact's text as the snippet. |
 | `get_symbol` | `name`, `repo` | Up to 5 definitions with that name, each with its full indexed source, path and line range. A source over 400 lines is cut and marked `cut`. `total` and `truncated` say whether more matched. |
 | `find_callers` | `name`, `repo` | The rows of `ccctx callers`. |
 | `find_callees` | `name`, `repo` | The rows of `ccctx calls`. |
 | `impact_of` | `name`, `depth` (default 3, 1 to 5), `repo` | The rows of `ccctx impact`, with hop counts. |
 | `read_wiki` | `page`, `repo` | With `page`: the page's text, state, compile time and compiler, and its citations, each with repository, path and line range, the same as `ccctx wiki show`. Without `page`: the pages with their state and first purpose sentence, at most 200. |
 | `list_repositories` | none | The registered repositories, the same as `ccctx repo list`. |
+| `recall` | `repo`, `topic`, `limit` (default 20, 1 to 50) | What earlier sessions worked out: the facts, fresh and most confident first or most related to `topic`, each with its text, confidence, state, run IDs and the location of its code, and the 10 newest runs. Never calls a model. |
 
 - **Names** work as in the graph commands: a bare `url_for` matches every `url_for`, and `Flask.url_for` only that method.
 - **Limits:** the graph tools return at most 200 rows, with `truncated` set when there were more.
 - **Refusals:** bad input, an unknown repository or language, a missing model and a stopped database all come back as `"status": "unavailable"` with a reason. A call with an argument the tool does not take is refused.
 - **Logging:** each call writes one line to standard error with the tool, time, status and result count.
+- **Memory:** each call is also recorded as a run (see Agent memory). The server's instructions tell clients to call
+  `recall` first.
+
+**Changed in 1.2.0.** `recall` is new, `search_code` can return `fact` hits, and the server sends instructions.
+Nothing was removed or renamed.
 
 **Changed in 1.1.0.** `read_wiki` is new, and `search_code` can return page hits: `start_line` and `end_line` may be null, and every hit has a `state` (null for a symbol). Nothing was removed or renamed.
 
@@ -438,7 +511,8 @@ src/golestan_code_mcp/    config, db check, sample cloner, MCP server
   semantic.py             model and hybrid index setup, hybrid / text / vector search, language and count filters
   graph.py                call and import edges from stored refs; callers, calls, impact via GRAPH_TABLE; definitions
   wiki.py                 module pages from the index: compile, cite, mark stale, recompile, read
-  server.py               the seven MCP tools (`ccctx mcp`)
+  memory.py               agent memory: record runs, distil facts, re-check, recall, fact hits in search
+  server.py               the eight MCP tools (`ccctx mcp`)
   cli.py                  the ccctx command
 tests/                    pytest suite and chunker fixtures
 ```

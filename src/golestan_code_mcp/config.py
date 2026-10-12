@@ -97,6 +97,23 @@ def vendor_dirs(env: Mapping[str, str]) -> frozenset[str]:
     return frozenset(part.strip() for part in text.split(",") if part.strip())
 
 
+@dataclass(frozen=True)
+class MemoryModel:
+    """The language model that writes fact text (constitution I, memory exception). Optional: None means templates."""
+    model: str
+    base: str | None = None
+    key: str | None = field(default=None, repr=False)
+
+
+def memory_model(env: Mapping[str, str]) -> MemoryModel | None:
+    """CCCTX_MEMORY_MODEL is a LiteLLM model string; unset or blank sends nothing out."""
+    def get(name: str) -> str | None:
+        return (env.get(name) or "").strip() or None
+
+    model = get("CCCTX_MEMORY_MODEL")
+    return MemoryModel(model, get("CCCTX_MEMORY_MODEL_BASE"), get("CCCTX_MEMORY_MODEL_KEY")) if model else None
+
+
 def load(env: Mapping[str, str] | None = None, dotenv_path: Path | None = PROJECT_ROOT / ".env") -> Config:
     """Build a Config. Errors name settings, never values of secrets."""
     if env is None:

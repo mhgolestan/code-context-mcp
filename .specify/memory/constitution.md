@@ -1,15 +1,16 @@
 <!--
 Sync Impact Report
-- Version change: (template, unversioned) → 1.0.0
-- Modified principles: all placeholders replaced (initial ratification)
-  - [PRINCIPLE_1_NAME] → I. Database-Native Intelligence
-  - [PRINCIPLE_2_NAME] → II. Structure-Aware Ingestion
-  - [PRINCIPLE_3_NAME] → III. MCP as the Single Interface
-  - [PRINCIPLE_4_NAME] → IV. Hybrid, Explainable Retrieval
-  - [PRINCIPLE_5_NAME] → V. Self-Improvement with Provenance
-- Added principles: VI. Measured Quality (Test-First), VII. Safety & Simplicity
-- Added sections: Technology & Data Constraints; Development Workflow & Quality Gates
+- Version change: 1.0.0 → 1.1.0 (MINOR: expanded guidance; no principle removed or renamed)
+- Modified principles:
+  - I. Database-Native Intelligence: indexing stated to have no exceptions; added one opt-in
+    exception for agent-memory distillation, with an optional, documented model and per-fact
+    provenance
+- Added sections: none
 - Removed sections: none
+- Reason: feature 010-agent-memory uses Oracle's AI Agent Memory package in full, including
+  its language-model extraction (user decision, 2026-10-12)
+- Migration: specs/010-agent-memory plan and spec must be updated to the exception's rules;
+  earlier specs are unaffected (they send nothing out)
 - Templates: none modified (dependent templates read this file at runtime)
 - Deferred TODOs: none
 -->
@@ -27,12 +28,22 @@ answers plain-English questions over them, and serves everything over the Model 
 - Embedding generation, hybrid (keyword + semantic) search, and code-relationship (graph)
   queries MUST run inside the database engine. The reference stack is Oracle AI Database 26ai.
 - Source code MUST NOT be sent to an external service to be indexed, and the core feature set
-  MUST work without any third-party embedding API key.
+  MUST work without any third-party embedding API key. Indexing (chunking, embeddings, search,
+  graph) has no exceptions.
+- One exception applies to agent-memory distillation: it MAY send tool-call results, including
+  code snippets and symbol source, to a language model the operator explicitly configures.
+  - The model MUST be optional. With none configured, memory MUST still record, consolidate
+    (with a local distiller that sends nothing out) and recall. No core feature may need a
+    third-party API key.
+  - The configured model and exactly what is sent to it MUST be documented.
+  - Every distilled fact MUST record whether a model wrote it, and which one.
 - An alternative stack is permitted only if a plan documents how it meets the same guarantees;
   each extra piece of infrastructure MUST be justified in the plan's Complexity Tracking.
 
 Rationale: one engine for vectors, text, and graph keeps code private, removes API-key
-setup, and avoids synchronizing three or four separate stores.
+setup, and avoids synchronizing three or four separate stores. Memory distillation is the one
+place where a model's reading of the code is worth sending it out. It is opt-in, it is
+recorded on every fact it touches, and it is never needed to find code.
 
 ### II. Structure-Aware Ingestion
 
@@ -151,4 +162,4 @@ codebase is easier to verify than a clever one.
 - Compliance is reviewed at every plan's Constitution Check and at code review; justified
   deviations MUST be recorded in the plan's Complexity Tracking table.
 
-**Version**: 1.0.0 | **Ratified**: 2026-10-10 | **Last Amended**: 2026-10-10
+**Version**: 1.1.0 | **Ratified**: 2026-10-10 | **Last Amended**: 2026-10-12

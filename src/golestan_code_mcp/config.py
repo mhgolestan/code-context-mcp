@@ -83,6 +83,30 @@ def vector_weight(env: Mapping[str, str]) -> float:
     return _weight(env, "CCCTX_VECTOR_WEIGHT")
 
 
+def _number(env: Mapping[str, str], name: str, default: str) -> tuple[str, float]:
+    text = (env.get(name) or "").strip() or default
+    try:
+        return text, float(text)
+    except ValueError:
+        return text, float("nan")
+
+
+def feedback_cap(env: Mapping[str, str]) -> float:
+    """The most usage feedback can raise a score, as a fraction. 0 switches feedback off."""
+    text, value = _number(env, "CCCTX_FEEDBACK_CAP", "0.2")
+    if not 0 <= value <= 1:  # also refuses nan
+        raise ConfigError(f"invalid setting: CCCTX_FEEDBACK_CAP={text!r} (expected a number from 0 to 1)")
+    return value
+
+
+def feedback_half_life(env: Mapping[str, str]) -> float:
+    """Days after which a use counts half as much."""
+    text, value = _number(env, "CCCTX_FEEDBACK_HALF_LIFE_DAYS", "30")
+    if not value > 0:
+        raise ConfigError(f"invalid setting: CCCTX_FEEDBACK_HALF_LIFE_DAYS={text!r} (expected a positive number)")
+    return value
+
+
 def max_file_bytes(env: Mapping[str, str]) -> int:
     text = (env.get("CCCTX_MAX_FILE_BYTES") or "").strip() or "1048576"
     if not text.isdigit() or int(text) < 1:

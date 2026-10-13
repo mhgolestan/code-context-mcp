@@ -216,6 +216,23 @@ MIGRATIONS: list[tuple[int, str, list[str]]] = [
         "create index ccctx_memory_run_repos_repo_ix on ccctx_memory_run_repos (repo_id, consolidated)",
         lambda cur: _package_schema(cur.connection),
     ]),
+    # One row per result per session (011 FR-005), kept by the writer's MERGE: a unique key on two 1024-character
+    # columns would pass Oracle's index key limit. Keyed by identity, not symbol id, so a re-ingest keeps it.
+    (9, "usage feedback", [
+        """create table ccctx_feedback (
+          id       number generated always as identity primary key,
+          repo_id  number not null references ccctx_repos (id) on delete cascade,
+          path     varchar2(1024 char) not null,
+          name     varchar2(1024 char) not null,
+          kind     varchar2(32) not null,
+          how      varchar2(8)  not null,
+          client   varchar2(256),
+          session_id varchar2(64) not null,
+          run_id   number references ccctx_memory_runs (id) on delete set null,
+          used_at  timestamp with time zone default systimestamp not null,
+          constraint ccctx_feedback_how_ck check (how in ('cited', 'opened')))""",
+        "create index ccctx_feedback_result_ix on ccctx_feedback (repo_id, name)",
+    ]),
 ]
 
 

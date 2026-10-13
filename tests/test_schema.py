@@ -449,5 +449,50 @@ def test_memory_run_and_repo_delete_cascade_links(conn, repo_id):
     conn.rollback()
 
 
-def test_schema_version_is_eight(conn):
-    assert schema.version(conn) == 8
+# --- usage feedback (specs/011-usage-feedback/data-model.md) ---
+
+TABLES |= {"CCCTX_FEEDBACK"}
+
+
+def add_use(cur, repo_id, how="cited", run_id=None):
+    return insert(cur, "insert into ccctx_feedback (repo_id, path, name, kind, how, client, session_id, run_id)"
+                       " values (:r, 'a.py', 'f', 'function', :h, 'c', 's', :run)", r=repo_id, h=how, run=run_id)
+
+
+def test_usage_feedback_table(conn):
+    with conn.cursor() as cur:
+        cur.execute("select name from ccctx_migrations where version = 9")
+        assert cur.fetchone() == ("usage feedback",)
+        uses = columns_of(cur, "CCCTX_FEEDBACK")
+        assert {c: v[1] for c, v in uses.items()} == {
+            "ID": "N", "REPO_ID": "N", "PATH": "N", "NAME": "N", "KIND": "N", "HOW": "N", "CLIENT": "Y",
+            "SESSION_ID": "N", "RUN_ID": "Y", "USED_AT": "N",
+        }
+        assert uses["USED_AT"][0].startswith("TIMESTAMP")
+        cur.execute("select column_name from user_ind_columns where index_name = 'CCCTX_FEEDBACK_RESULT_IX'"
+                    " order by column_position")
+        assert [row[0] for row in cur] == ["REPO_ID", "NAME"]
+
+
+def test_use_how_check_and_default_time(conn, repo_id):
+    with conn.cursor() as cur:
+        use = add_use(cur, repo_id, "opened")
+        assert cur.execute("select used_at from ccctx_feedback where id = :i", i=use).fetchone()[0] is not None
+        with pytest.raises(oracledb.DatabaseError, match="CCCTX_FEEDBACK_HOW_CK"):
+            add_use(cur, repo_id, "liked")
+    conn.rollback()
+
+
+def test_uses_go_with_their_repository_and_outlive_their_run(conn, repo_id):
+    with conn.cursor() as cur:
+        run_id = add_run(cur)
+        use = add_use(cur, repo_id, run_id=run_id)
+        cur.execute("delete from ccctx_memory_runs where id = :i", i=run_id)
+        assert cur.execute("select run_id from ccctx_feedback where id = :i", i=use).fetchone() == (None,)
+        cur.execute("delete from ccctx_repos where id = :i", i=repo_id)
+        assert cur.execute("select count(*) from ccctx_feedback where id = :i", i=use).fetchone()[0] == 0
+    conn.rollback()
+
+
+def test_schema_version_is_nine(conn):
+    assert schema.version(conn) == 9

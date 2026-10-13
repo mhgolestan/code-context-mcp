@@ -19,7 +19,7 @@ from decimal import Decimal
 
 import oracledb
 
-from golestan_code_mcp import __version__, db, graph, registry, semantic, wiki
+from golestan_code_mcp import __version__, db, feedback, graph, registry, semantic, wiki
 from golestan_code_mcp.config import environment, load, memory_model
 
 AGENT = "ccctx"
@@ -71,6 +71,14 @@ def run_of(tool: str, arguments: dict, result, client: str | None, ms: int) -> d
             "result_count": len(rows), "results": rows, "repos": repos}
 
 
+def store_use(conn, use: dict) -> None:
+    """Write one use (011): its repository by name, its run by the id the writer gave it, if it was written."""
+    with conn.cursor() as cur:
+        feedback.write_use(cur, use | {"repo_id": registry.repo_id(conn, use["repo"]),
+                                       "run_id": (use.get("run") or {}).get("id")})
+    conn.commit()
+
+
 def store_runs(conn, runs: list[dict]) -> None:
     """Insert runs and their repository links, in order, then commit. Unknown repositories are skipped."""
     with conn.cursor() as cur:
@@ -85,13 +93,14 @@ def store_runs(conn, runs: list[dict]) -> None:
                 t=run["tool"], a=json.dumps(run["arguments"], default=str), q=run["question"], c=run["client"],
                 s=run["status"], r=run["reason"], ms=run["ms"], n=run["result_count"],
                 res=json.dumps(run["results"], default=str), sc=bool(links), i=run_id)
-            rid = run_id.getvalue()[0]
+            rid = run["id"] = run_id.getvalue()[0]  # a use queued after this run links to it (011 research R3)
             cur.executemany("insert into ccctx_memory_run_repos (run_id, repo_id) values (:r, :p)",
                             [{"r": rid, "p": p} for p in links])
     conn.commit()
 
 
-# One writer thread with one connection keeps runs in call order and off the answering path (research R2).
+# One writer thread with one connection keeps runs in call order and off the answering path (research R2). Uses
+# (011) queue as {"use": ...} behind the run that returned their result, so the run already has its id.
 _runs: queue.Queue = queue.Queue()
 _writer: threading.Thread | None = None
 _writer_lock = threading.Lock()
@@ -99,6 +108,7 @@ _STOP = object()
 
 
 def record(run: dict) -> None:
+    """Queue a run, or a use as {"use": use}, for the writer thread."""
     global _writer
     with _writer_lock:
         if _writer is None:
@@ -117,10 +127,14 @@ def _write_runs() -> None:
                 return
             if conn is None:
                 conn = db.connect(load())
-            store_runs(conn, [run])
-        except Exception as e:  # never reaches the client (FR-003); the run is dropped
-            reason = db.describe(e) if isinstance(e, oracledb.Error) else str(e)
-            log.warning(json.dumps({"event": "memory_record_failed", "tool": run["tool"], "reason": reason[:300]}))
+            if "use" in run:
+                store_use(conn, run["use"])
+            else:
+                store_runs(conn, [run])
+        except Exception as e:  # never reaches the client (FR-003); the run or use is dropped
+            reason = (db.describe(e) if isinstance(e, oracledb.Error) else str(e))[:300]
+            log.warning(json.dumps({"event": "feedback_record_failed", "reason": reason} if "use" in run else
+                                   {"event": "memory_record_failed", "tool": run["tool"], "reason": reason}))
             if conn is not None:
                 try:
                     conn.close()
@@ -153,6 +167,7 @@ class RunView:
     reason: str | None
     result_count: int
     top: dict | None
+    used: list[str] = field(default_factory=list)  # names of results with a use linked to this run, in result order
 
 
 def runs(conn, repo: str | None = None, limit: int = 20, skip_tool: str | None = None) -> list[RunView]:
@@ -167,7 +182,22 @@ def runs(conn, repo: str | None = None, limit: int = 20, skip_tool: str | None =
             "                                 where l.run_id = r.id and l.repo_id = :rid))"
             "   and (:skip is null or r.tool <> :skip)"
             " order by r.id desc fetch first :lim rows only", rid=rid, skip=skip_tool, lim=limit)
-        return [RunView(*row[:8], json.loads(row[8]) if row[8] else None) for row in cur]
+        found = cur.fetchall()
+        used: dict[int, set] = {}
+        orders: dict[int, list] = {}
+        if found:  # at most `limit` runs, so one IN list
+            binds = ", ".join(f":{n + 1}" for n in range(len(found)))
+            cur.execute(f"select run_id, path, name from ccctx_feedback where run_id in ({binds})",
+                        [row[0] for row in found])
+            for run_id, path, name in cur:
+                used.setdefault(run_id, set()).add((path, name))
+        if used:
+            binds = ", ".join(f":{n + 1}" for n in range(len(used)))
+            cur.execute(f"select id, results from ccctx_memory_runs where id in ({binds})", list(used))
+            orders = {i: _json(res) or [] for i, res in cur}
+    return [RunView(*row[:8], json.loads(row[8]) if row[8] else None,
+                    [r["name"] for r in orders.get(row[0], []) if (r.get("path"), r.get("name")) in used[row[0]]])
+            for row in found]
 
 
 def _store(conn, policy, embedder, store_id: str):
@@ -213,7 +243,7 @@ def model(env: Mapping[str, str] | None = None):
 
 # --- findings: what one run says about one subject (research R5) ---
 
-NO_FACTS = {"list_repositories", "recall"}
+NO_FACTS = {"list_repositories", "recall", "mark_used"}
 NAMES = 5  # callers, callees or reached symbols named in a fact
 SOURCE_LINES = 200  # of the subject's source sent to a configured model (research R13)
 

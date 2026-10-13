@@ -20,6 +20,8 @@ from golestan_code_mcp import db
 from golestan_code_mcp.chunker import EXTENSIONS
 from golestan_code_mcp.config import (
     environment,
+    feedback_cap,
+    feedback_half_life,
     model_cache,
     model_url,
     search_candidates,
@@ -71,6 +73,8 @@ class Result:
     language: str
     snippet: str  # the opening of the stored source: at most SNIPPET_LINES lines and SNIPPET_CHARS characters
     state: str | None = None  # a page hit's fresh or stale; None for a symbol
+    relevance: float = 0.0  # the score before feedback
+    feedback: float = 0.0  # the usage feedback boost: score = relevance * (1 + feedback); 0 for facts (011)
 
 
 def check_limit(limit) -> int:
@@ -244,8 +248,11 @@ def _definitions(cur, name: str) -> dict[str, tuple]:
 
 
 def search(conn, question: str, repos: list[str] | None = None, mode: str = "hybrid",
-           env: Mapping[str, str] | None = None, language: str | None = None, limit: int = LIMIT) -> list[Result]:
+           env: Mapping[str, str] | None = None, language: str | None = None, limit: int = LIMIT,
+           feedback: bool = True) -> list[Result]:
     """At most `limit` symbols for the question. Identifier definitions first, then fused order.
+
+    feedback: results earlier sessions used are raised by at most the cap, among the candidates found (011 R5).
 
     hybrid: keyword and semantic sides fused with RRF (UNION). vector: semantic side only, none below FLOOR.
     text: keyword side only, every word must appear. `repos` narrows to those repositories; None searches all.
@@ -282,11 +289,16 @@ def search(conn, question: str, repos: list[str] | None = None, mode: str = "hyb
         page_hits, pages = _page_candidates(cur, request)
 
     fused = _fuse(hits, symbols, in_scope)
+    found = _fuse(page_hits, pages, in_scope)
+    boosts = _boosts(conn, symbols | definitions | pages, env) if feedback else {}
+    if boosts:
+        _boost(fused + found, boosts)
+        fused.sort(key=lambda f: -f["score"])  # stable: ties keep the fused order
     by_rowid = {f["rowid"]: f for f in fused}
-    first = [by_rowid.get(r) or {"rowid": r, "score": 0.0, "similarity": None, "text": None, "vector": None}
+    first = [by_rowid.get(r) or {"rowid": r, "score": 0.0, "relevance": 0.0, "feedback": 0.0, "similarity": None,
+                                 "text": None, "vector": None}
              for r, d in definitions.items() if in_scope(d)]
     first.sort(key=lambda f: (f["rowid"] not in by_rowid, -f["score"]))  # found by the search first, then path
-    found = _fuse(page_hits, pages, in_scope)
     named = [f for f in found if names_module(question, pages[f["rowid"]][3])]  # "the json module": its page first
     rest = _place([f for f in fused if f["rowid"] not in definitions], [f for f in found if f not in named])
     rest = sorted(named, key=lambda f: -(f["similarity"] or -1)) + rest
@@ -295,14 +307,38 @@ def search(conn, question: str, repos: list[str] | None = None, mode: str = "hyb
         from golestan_code_mcp import memory  # memory imports this module
 
         facts = memory.search_facts(conn, question, repos, language)
-        rest = _place(rest, [{"rowid": f"fact:{n}", "score": 0.0, "similarity": f["similarity"], "text": None,
-                              "vector": n} for n, f in enumerate(facts, 1)])
+        rest = _place(rest, [{"rowid": f"fact:{n}", "score": 0.0, "relevance": 0.0, "feedback": 0.0,
+                              "similarity": f["similarity"], "text": None, "vector": n} for n, f in enumerate(facts, 1)])
         rows |= {f"fact:{n}": (None, f["repo"], "fact", f["name"], f["path"], f["start_line"], f["end_line"],
                                f["language"], f["snippet"], "fresh") for n, f in enumerate(facts, 1)}
     return [
-        Result(rank, f["score"], f["similarity"], f["text"], f["vector"], *rows[f["rowid"]][1:])
+        Result(rank, f["score"], f["similarity"], f["text"], f["vector"], *rows[f["rowid"]][1:],
+               relevance=f["relevance"], feedback=f["feedback"])
         for rank, f in enumerate((first + rest)[:limit], 1)
     ]
+
+
+def _boosts(conn, rows: dict[str, tuple], env: Mapping[str, str]) -> dict[str, float]:
+    """rowid -> boost for the candidates with uses, by identity (repo id, path, name). Empty with a cap of 0."""
+    cap = feedback_cap(env)
+    if not cap or not rows:
+        return {}
+    from golestan_code_mcp import feedback as usage  # feedback is this function's caller's parameter
+
+    with conn.cursor() as cur:
+        weights = usage.weights(cur, {r[0] for r in rows.values()}, feedback_half_life(env))
+    return {rowid: usage.boost(weights[key][1], cap) for rowid, r in rows.items()
+            if (key := (r[0], r[4], r[3])) in weights}
+
+
+def _boost(entries: list[dict], boosts: dict[str, float]) -> None:
+    """Raise each entry's score by its boost, and a page's similarity for placing it (at most 1)."""
+    for f in entries:
+        b = boosts.get(f["rowid"], 0.0)
+        if b:
+            f["feedback"], f["score"] = b, f["relevance"] * (1 + b)
+            if f["similarity"] is not None:
+                f["placed"] = min(1.0, f["similarity"] * (1 + b))
 
 
 def _fuse(hits: list[dict], rows: dict[str, tuple], in_scope) -> list[dict]:
@@ -326,7 +362,8 @@ def _fuse(hits: list[dict], rows: dict[str, tuple], in_scope) -> list[dict]:
         keyword_hit = bool(h.get("text_score"))
         if not keyword_hit and (similarity is None or similarity < FLOOR):
             continue  # a weak meaning-only match is worse than none; keyword matches always count
-        fused.append({"rowid": rowid, "score": float(h["score"]), "similarity": similarity,
+        fused.append({"rowid": rowid, "score": float(h["score"]), "relevance": float(h["score"]), "feedback": 0.0,
+                      "similarity": similarity,
                       "text": h["text_rank"] if h.get("text_score") else None,
                       "vector": h["vector_rank"] if h.get("vector_score") else None})
     for side in ("text", "vector"):  # ranks among the rows searched, not across the whole index
@@ -355,11 +392,12 @@ def _place(hits: list[dict], pages: list[dict]) -> list[dict]:
     """
     placed = list(hits)
     for page in pages:
-        if page["similarity"] is None:
+        similarity = page.get("placed", page["similarity"])  # a used page's similarity, boosted (011 R5)
+        if similarity is None:
             placed.append(page)
             continue
         at = next((i for i, h in enumerate(placed)
-                   if h["similarity"] is None or h["similarity"] < page["similarity"]), len(placed))
+                   if h["similarity"] is None or h["similarity"] < similarity), len(placed))
         placed.insert(at, page)
     return placed
 

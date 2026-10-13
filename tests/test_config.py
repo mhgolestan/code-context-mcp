@@ -10,6 +10,8 @@ from golestan_code_mcp.config import (
     memory_model,
     model_cache,
     model_url,
+    feedback_cap,
+    feedback_half_life,
     search_candidates,
     text_weight,
     vector_weight,
@@ -121,3 +123,23 @@ def test_memory_model_environment_wins_over_dotenv(tmp_path, monkeypatch):
     assert memory_model(environment(dotenv)).model == "from/dotenv"
     monkeypatch.setenv("CCCTX_MEMORY_MODEL", "from/env")
     assert memory_model(environment(dotenv)).model == "from/env"
+
+
+def test_feedback_settings_defaults_and_overrides():
+    assert (feedback_cap({}), feedback_half_life({})) == (0.2, 30.0)
+    assert feedback_cap({"CCCTX_FEEDBACK_CAP": "0"}) == 0.0 and feedback_cap({"CCCTX_FEEDBACK_CAP": " 1 "}) == 1.0
+    assert feedback_half_life({"CCCTX_FEEDBACK_HALF_LIFE_DAYS": "7.5"}) == 7.5
+
+
+@pytest.mark.parametrize(("accessor", "name", "bad"), [
+    (feedback_cap, "CCCTX_FEEDBACK_CAP", "-0.1"),
+    (feedback_cap, "CCCTX_FEEDBACK_CAP", "1.5"),
+    (feedback_cap, "CCCTX_FEEDBACK_CAP", "lots"),
+    (feedback_cap, "CCCTX_FEEDBACK_CAP", "nan"),
+    (feedback_half_life, "CCCTX_FEEDBACK_HALF_LIFE_DAYS", "0"),
+    (feedback_half_life, "CCCTX_FEEDBACK_HALF_LIFE_DAYS", "-30"),
+    (feedback_half_life, "CCCTX_FEEDBACK_HALF_LIFE_DAYS", "month"),
+])
+def test_bad_feedback_settings_named(accessor, name, bad):
+    with pytest.raises(ConfigError, match=name):
+        accessor({name: bad})

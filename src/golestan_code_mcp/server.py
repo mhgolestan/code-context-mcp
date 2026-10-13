@@ -7,6 +7,7 @@ import logging
 import posixpath
 import sys
 import time
+import uuid
 from datetime import UTC
 from typing import Annotated, Literal
 
@@ -15,7 +16,7 @@ from mcp.server.fastmcp import FastMCP
 from mcp.types import ToolAnnotations
 from pydantic import BaseModel, ConfigDict, Field
 
-from golestan_code_mcp import db, graph, memory, registry, schema, semantic, wiki
+from golestan_code_mcp import db, feedback, graph, memory, registry, schema, semantic, wiki
 from golestan_code_mcp.config import ConfigError, load
 
 NAME = "golestan_code_mcp"
@@ -27,6 +28,10 @@ INSTRUCTIONS = (
 mcp = FastMCP(NAME, instructions=INSTRUCTIONS)
 log = logging.getLogger("golestan_code_mcp.server")
 READ_ONLY = ToolAnnotations(readOnlyHint=True)
+SESSION = str(uuid.uuid4())  # one stdio connection per process: the session a use belongs to (011 research R2)
+# (repo, path, name) -> the run of the latest search_code that returned it, for linking uses to it.
+# ponytail: one stdio session per process; key by ctx.session for multi-session transports
+_returned: dict[tuple[str, str, str], dict] = {}
 LIMIT = 200  # graph tools return at most this many rows; truncated says when more existed
 
 Name = Annotated[str, Field(description="A bare name (url_for), which matches url_for and every Class.url_for, or a "
@@ -44,9 +49,31 @@ def _client() -> str | None:
         return None
 
 
+def _use(repo: str, path: str, name: str, kind: str, how: str) -> None:
+    """Queue a use of a result behind the runs before it, linked to the search that returned it, if one did."""
+    memory.record({"use": {"repo": repo, "path": path, "name": name, "kind": kind, "how": how, "client": _client(),
+                           "session": SESSION, "run": _returned.get((repo, path, name))}})
+
+
+def _opened(tool: str, result) -> None:
+    """Reading a result this session's searches returned is an opened use (011 research R8)."""
+    if getattr(result, "status", None) != "ok":
+        return
+    if tool == "get_symbol":
+        read = [(h.repo, h.path, h.name, h.kind) for h in result.results]
+    elif tool == "read_wiki" and result.page is not None:
+        read = [(result.page.repo, result.page.directory, result.page.name, "page")]
+    else:
+        return
+    for repo, path, name, kind in read:
+        if (repo, path, name) in _returned:
+            _use(repo, path, name, kind, "opened")
+
+
 def _logged(tool):
     """One structured record per call: tool, latency, status, result count, never the arguments or results.
-    Then the call is recorded as a run for agent memory, which can never change or delay the answer (010 FR-003)."""
+    Then the call is recorded as a run for agent memory, which can never change or delay the answer (010 FR-003),
+    and a search's results are remembered for the uses that may follow (011)."""
     signature = inspect.signature(tool)
 
     @functools.wraps(tool)
@@ -69,7 +96,11 @@ def _logged(tool):
             try:
                 # FastMCP passes every parameter, defaults included: record the effective call, minus unset ones
                 arguments = {k: v for k, v in signature.bind(*args, **kwargs).arguments.items() if v is not None}
-                memory.record(memory.run_of(tool.__name__, arguments, result, _client(), ms))
+                run = memory.run_of(tool.__name__, arguments, result, _client(), ms)
+                memory.record(run)
+                if tool.__name__ == "search_code":
+                    _returned.update({(r["repo"], r["path"], r["name"]): run for r in run["results"]})
+                _opened(tool.__name__, result)
             except Exception:  # noqa: BLE001 - recording must never reach the client
                 log.exception("could not record the run")
     return wrapper
@@ -97,6 +128,8 @@ def _repos(repo: str | None) -> list[str] | None:
 class SearchHit(BaseModel):
     rank: int
     score: float
+    relevance: float
+    feedback: float
     similarity: float | None
     keyword_rank: int | None
     semantic_rank: int | None
@@ -123,7 +156,9 @@ class SearchResults(BaseModel):
     "name, use get_symbol to read it, find_callers for its call sites, or impact_of for what a change would "
     "affect. Returns up to limit hits (default 10), best first. Each hit has the repository, path, symbol "
     "name, kind, language, line range, a snippet of the symbol's opening lines, and the scores behind its "
-    "rank: the fused score, the keyword rank and the semantic rank (null when that side did not find it). "
+    "rank: the score, the relevance (the score before feedback), the feedback boost, the keyword rank and the "
+    "semantic rank (null when that side did not find it). The feedback field is the boost from earlier sessions "
+    "marking the result used: at most 0.2 (20 percent), fading over 30 days; relevance is the score before it. "
     "Keyword and semantic search are fused, and the definitions of an exact identifier come first. A hit of "
     "kind page is a wiki page about a whole module: its name is the page name, its path is the module's "
     "directory, its line range is null and its state says whether it is fresh or stale; read it with "
@@ -141,6 +176,9 @@ def search_code(
     language: Annotated[str | None, Field(description="Search only files of this language: one of "
                                           f"{', '.join(semantic.LANGUAGES)}. Default: all languages.")] = None,
     limit: Annotated[int, Field(description="How many hits to return, 1 to 50. Default 10.")] = 10,
+    feedback: Annotated[bool, Field(description="Raise results that earlier sessions used, by at most 20 percent of "
+                                    "their score. false ranks by relevance alone, exactly as with no feedback "
+                                    "recorded. Default true.")] = True,
 ) -> SearchResults:
     def check():
         if not query.strip():
@@ -149,7 +187,7 @@ def search_code(
         semantic.check_language(language)
 
     def query_(conn):
-        hits = semantic.search(conn, query, _repos(repo), language=language, limit=limit)
+        hits = semantic.search(conn, query, _repos(repo), language=language, limit=limit, feedback=feedback)
         return SearchResults(status="ok", reason=None, results=[SearchHit(**vars(h)) for h in hits])
 
     return _answer(SearchResults, check, query_)
@@ -507,6 +545,46 @@ def recall(
     return _answer(RecallResults, check, query, empty={})
 
 
+class MarkUsedResult(BaseModel):
+    status: Literal["ok", "unavailable"]
+    reason: str | None
+    repo: str
+    path: str
+    name: str
+    kind: str | None
+    linked: bool
+
+
+@mcp.tool(
+    description="Tell the server a result helped: call this for each search hit you cite in your answer or rely on. "
+    "Pass the hit's repo, path and name exactly as search_code returned them. Results that clients mark get a small, "
+    "capped boost in later searches, and the boost fades over 30 days. Reading a hit with get_symbol or read_wiki "
+    "already counts as a lighter use, so mark only what you actually used.",
+    annotations=ToolAnnotations(readOnlyHint=False, idempotentHint=True, destructiveHint=False),
+)
+@_logged
+def mark_used(
+    repo: Annotated[str, Field(description="The hit's repository, exactly as search_code returned it, for example "
+                               "flask.")],
+    path: Annotated[str, Field(description="The hit's path, exactly as search_code returned it (a page hit's "
+                               "directory).")],
+    name: Annotated[str, Field(description="The hit's name, exactly as search_code returned it, for example url_for "
+                               "or Flask.url_for.")],
+) -> MarkUsedResult:
+    def query(conn):
+        rid = registry.repo_id(conn, repo)
+        with conn.cursor() as cur:
+            kind = feedback.resolve(cur, rid, path, name)
+        if kind is None:
+            raise ValueError(f"not found: no indexed symbol or page named '{name}' at '{path}' in '{repo}'")
+        _use(repo, path, name, kind, "cited")  # recorded in the background: a failure never changes this answer
+        return MarkUsedResult(status="ok", reason=None, repo=repo, path=path, name=name, kind=kind,
+                              linked=(repo, path, name) in _returned)
+
+    return _answer(MarkUsedResult, lambda: None, query,
+                   empty={"repo": repo, "path": path, "name": name, "kind": None, "linked": False})
+
+
 # FastMCP drops arguments a tool does not declare. Refuse them instead: a stale `repos` would otherwise widen a
 # search to every repository without saying so.
 for _tool in mcp._tool_manager.list_tools():
@@ -520,6 +598,11 @@ def main() -> None:
     log.addHandler(logging.StreamHandler(sys.stderr))  # stdout carries the protocol
     log.setLevel(logging.INFO)
     log.propagate = False
+    # On Windows, loading an extension module (numpy's, under the memory package) while the stdio reader thread is
+    # blocked reading stdin hangs the process. The first fact search or recall would do that, so load it first.
+    import oracleagentmemory.core  # noqa: F401
+    import oracleagentmemory.core.embedders  # noqa: F401
+
     mcp.run("stdio")
 
 

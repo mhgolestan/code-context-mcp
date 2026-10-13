@@ -213,7 +213,7 @@ def test_model_load_when_present(model, capsys):
     assert code == 0 and out.strip() == "model ALL_MINILM_L12_V2 already present (384 dimensions)"
 
 
-HEADER = ["RANK", "SCORE", "KEYWORD", "SEMANTIC", "REPO", "KIND", "NAME", "PATH", "LINES"]
+HEADER = ["RANK", "SCORE", "FEEDBACK", "KEYWORD", "SEMANTIC", "REPO", "KIND", "NAME", "PATH", "LINES"]
 
 
 def table(out):
@@ -229,6 +229,21 @@ def test_search_prints_ranked_table(ingested, capsys):
     assert code == 0 and rows[0][:1] == ["1"] and rows[0][6] == "a"  # the definition of `a` comes first
     assert all(len(r[1].split(".")[1]) == 2 for r in rows)  # score with two decimals
     assert all(r[2] == "-" or r[2].isdigit() for r in rows) and all(r[3] == "-" or r[3].isdigit() for r in rows)
+
+
+def test_search_shows_the_feedback_column(live, capsys, monkeypatch):
+    hits = [semantic.Result(1, 48.0, 0.6, 1, 1, "flask", "function", "url_for", "src/flask/helpers.py", 1, 9, "python",
+                            "def url_for():", relevance=40.0, feedback=0.2),
+            semantic.Result(2, 30.0, 0.5, 2, 2, "flask", "function", "redirect", "src/flask/helpers.py", 10, 19,
+                            "python", "def redirect():", relevance=30.0)]
+    seen = []
+    monkeypatch.setattr(semantic, "search", lambda *a, **k: seen.append(k.get("feedback", True)) or hits)
+    code, out, _ = run(capsys, "search", "where is url_for")
+    header, first, second = out.splitlines()
+    assert code == 0 and header.split()[:3] == ["RANK", "SCORE", "FEEDBACK"]
+    assert first.split()[:3] == ["1", "48.00", "+20%"] and second.split()[:3] == ["2", "30.00", "2"]  # blank at 0
+    run(capsys, "search", "where is url_for", "--no-feedback")
+    assert seen == [True, False]
 
 
 @pytest.mark.parametrize(("mode", "keyword_dash", "semantic_dash"), [("text", False, True), ("vector", True, False)])
@@ -250,7 +265,7 @@ def test_search_repo_flags_narrow(ingested, capsys, monkeypatch):
     n, _ = ingested
     seen = []
     monkeypatch.setattr(semantic, "search", lambda conn, question, repos=None, mode="hybrid", env=None,
-                        language=None, limit=10: seen.append((repos, mode)) or [])
+                        language=None, limit=10, **_: seen.append((repos, mode)) or [])
     run(capsys, "search", "x", "--repo", n, "--repo", f"{n},gin", "--repo", n)
     run(capsys, "search", "x")
     assert seen == [([n, "gin"], "hybrid"), (None, "hybrid")]
@@ -307,7 +322,7 @@ def test_search_language_and_limit_match_core(ingested, capsys):
 def test_search_language_and_limit_reach_the_core(capsys, monkeypatch, live):
     seen = []
     monkeypatch.setattr(semantic, "search", lambda conn, question, repos=None, mode="hybrid", env=None,
-                        language=None, limit=10: seen.append((language, limit)) or [])
+                        language=None, limit=10, **_: seen.append((language, limit)) or [])
     run(capsys, "search", "x", "--language", "go", "--limit", "3")
     run(capsys, "search", "x")
     assert seen == [("go", 3), (None, 10)]
@@ -466,16 +481,20 @@ def test_mcp_child_process_serves_the_tools_from_any_directory(tmp_path):
         async with stdio_client(params) as (read, write), ClientSession(read, write) as client:
             await client.initialize()  # fails if anything but protocol messages reaches stdout
             tools = [t.name for t in (await client.list_tools()).tools]
-            return tools, (await client.call_tool("list_repositories", {})).structuredContent
+            repos = (await client.call_tool("list_repositories", {})).structuredContent
+            # recall loads the memory package (numpy): on Windows a lazy load under the stdio reader used to hang
+            recall = await asyncio.wait_for(client.call_tool("recall", {"limit": 1}), 60)
+            return tools, repos, recall.structuredContent
 
-    tools, repos = asyncio.run(session())
+    tools, repos, recall = asyncio.run(session())
     assert tools == ["search_code", "get_symbol", "find_callers", "find_callees", "impact_of", "read_wiki",
-                     "list_repositories", "recall"]
+                     "list_repositories", "recall", "mark_used"]
     try:
         db.connect(load()).close()
     except Exception:
         return  # without a database the listing above is the whole check
     assert repos["database"] == "reachable", repos["reason"]
+    assert recall["status"] in ("ok", "unavailable")  # answered, whatever the store's state
 
 
 # --- wiki (009 contracts/cli.md) ------------------------------------------------------------------------------
@@ -706,6 +725,23 @@ def test_memory_list_refusals(live, capsys):
     assert exit_.value.code == 2
 
 
+def test_memory_list_shows_used_of_returned(remembered, capsys):
+    from golestan_code_mcp import feedback
+
+    with db.connect(load()) as conn, conn.cursor() as cur:
+        rid = registry.repo_id(conn, remembered)
+        search = cur.execute("""select max(r.id) from ccctx_memory_runs r join ccctx_memory_run_repos l
+                                 on l.run_id = r.id where l.repo_id = :r and r.tool = 'search_code'""",
+                             r=rid).fetchone()[0]
+        feedback.write_use(cur, {"repo_id": rid, "path": "src/h.py", "name": "url_for", "kind": "function",
+                                 "how": "cited", "client": "t", "session": uuid.uuid4().hex, "run_id": search})
+        conn.commit()
+    code, out, _ = run(capsys, "memory", "list", "--repo", remembered)
+    rows = {line.split()[3]: line for line in out.splitlines()[1:]}
+    assert code == 0 and " 1/1 " in rows["search_code"]
+    assert not re.search(r" \d+/\d+ ", rows["find_callers"])  # the plain count otherwise
+
+
 def symbol_run(n, question, symbol, path, kind):
     return a_run("search_code", question, n, [{"kind": kind, "repo": n, "name": symbol, "path": path,
                                                "start_line": 1, "end_line": 9}])
@@ -775,3 +811,97 @@ def test_ingest_summary_memory_line():
         "Memory    not consolidated: memory down")
     current = replace(summary(), mode="current", commit="a" * 40, memory=busy)
     assert cli.format_summary(current).splitlines()[1].startswith("Memory    3 runs read")
+
+
+# --- ccctx feedback (specs/011-usage-feedback contracts/cli.md) -------------------------------------------------
+
+from golestan_code_mcp import feedback  # noqa: E402
+
+
+def test_feedback_add_then_list(ingested, capsys):
+    n, _ = ingested
+    code, out, _ = run(capsys, "feedback", "add", "a", "--repo", n, "--count", "3", "--days-ago", "30")
+    assert code == 0 and out.strip() == f"recorded 3 uses of a (app.py) in {n}, dated 30 days ago"
+    assert run(capsys, "feedback", "add", "B.c", "--repo", n, "--path", "app.py")[1].strip() == (
+        f"recorded 1 use of B.c (app.py) in {n}, dated 0 days ago")
+    code, out, _ = run(capsys, "feedback", "list", "--repo", n)
+    header, first, second = out.splitlines()
+    assert code == 0 and header.split() == ["KIND", "NAME", "PATH", "USES", "WEIGHT", "BOOST", "LAST", "USED", "INDEXED"]
+    assert first.split()[:6] == ["function", "a", "app.py", "3", "1.50", "+6%"] and first.split()[-1] == "yes"
+    assert second.split()[:6] == ["method", "B.c", "app.py", "1", "1.00", "+4%"]
+    assert re.search(r" \d{4}-\d\d-\d\d \d\d:\d\d:\d\d ", first)
+
+
+def test_feedback_list_empty_and_unknown(ingested, capsys):
+    n, _ = ingested
+    assert run(capsys, "feedback", "list", "--repo", n)[1].strip() == f"no feedback recorded for {n}"
+    code, _, err = run(capsys, "feedback", "list", "--repo", "t-nowhere")
+    assert code == 1 and "no repository named 't-nowhere'" in err
+
+
+def test_feedback_add_refusals(ingested, capsys, monkeypatch):
+    n, _ = ingested
+    code, _, err = run(capsys, "feedback", "add", "zz_nothing", "--repo", n)
+    assert code == 1 and err.startswith("error: not found: no indexed symbol or page named 'zz_nothing'")
+    monkeypatch.setattr(feedback, "add", lambda *a, **k: (_ for _ in ()).throw(
+        ValueError("'a' is at several paths; pass --path:\nx.py\ny.py")))
+    code, _, err = run(capsys, "feedback", "add", "a", "--repo", n)
+    assert code == 1 and err == "error: 'a' is at several paths; pass --path:\nx.py\ny.py\n"
+
+
+@pytest.mark.parametrize("argv", [["--days-ago", "-1"], ["--count", "0"], ["--count", "100001"], ["--count", "x"]])
+def test_feedback_add_bad_numbers_exit_2(capsys, argv):
+    with pytest.raises(SystemExit) as exit_:
+        cli.main(["feedback", "add", "a", "--repo", "flask", *argv])
+    assert exit_.value.code == 2
+
+
+def test_feedback_reset(ingested, capsys, monkeypatch):
+    n, _ = ingested
+    run(capsys, "feedback", "add", "a", "--repo", n, "--count", "2")
+    assert run(capsys, "feedback", "reset", "--repo", n)[1].strip() == f"deleted 2 uses in {n}"
+    assert run(capsys, "feedback", "list", "--repo", n)[1].strip() == f"no feedback recorded for {n}"
+    seen = []
+    monkeypatch.setattr(feedback, "reset", lambda conn, repo: seen.append(repo) or 7)
+    assert run(capsys, "feedback", "reset", "--all")[1].strip() == "deleted 7 uses in all repositories"
+    assert seen == [None]
+
+
+@pytest.mark.parametrize("argv", [[], ["--repo", "flask", "--all"]])
+def test_feedback_reset_needs_exactly_one_scope(capsys, argv):
+    with pytest.raises(SystemExit) as exit_:
+        cli.main(["feedback", "reset", *argv])
+    assert exit_.value.code == 2
+
+
+# --- ccctx eval (specs/011-usage-feedback contracts/cli.md) -----------------------------------------------------
+
+
+def test_eval_prints_questions_recall_and_misses(live, capsys, monkeypatch, tmp_path):
+    gold = tmp_path / "gold.json"
+    gold.write_text("{}", encoding="utf-8")
+    seen = []
+    monkeypatch.setattr(feedback, "load_gold", lambda path, conn: seen.append(path) or ["q"] * 3)
+    monkeypatch.setattr(feedback, "evaluate", lambda conn, g, with_feedback, limit: seen.append((with_feedback, limit))
+                        or feedback.Evaluation(3, 2, ["how does gin bind a JSON request body?"]))
+    code, out, _ = run(capsys, "eval", "--gold", str(gold))
+    assert code == 0 and out.splitlines() == ["Questions: 3", "recall@10: 0.67 (2/3)",
+                                              "missed: how does gin bind a JSON request body?"]
+    code, out, _ = run(capsys, "eval", "--gold", str(gold), "--with-feedback", "--limit", "5")
+    assert out.splitlines()[1] == "recall@5: 0.67 (2/3)"
+    assert seen == [str(gold), (False, 10), str(gold), (True, 5)]
+
+
+def test_eval_gold_errors_exit_1(live, capsys, tmp_path):
+    code, _, err = run(capsys, "eval", "--gold", str(tmp_path / "none.json"))
+    assert code == 1 and err.startswith("error: gold file not found: ")
+    (tmp_path / "bad.json").write_text('{"version": 1, "questions": [{"question": "x", "paths": []}]}')
+    code, _, err = run(capsys, "eval", "--gold", str(tmp_path / "bad.json"))
+    assert code == 1 and err.strip() == "error: gold file: question 1 has no paths"
+
+
+@pytest.mark.parametrize("limit", ["0", "51", "x"])
+def test_eval_bad_limit_exits_2(capsys, limit):
+    with pytest.raises(SystemExit) as exit_:
+        cli.main(["eval", "--gold", "gold.json", "--limit", limit])
+    assert exit_.value.code == 2

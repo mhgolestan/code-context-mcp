@@ -1,5 +1,6 @@
 """Agent memory (010): runs, facts, consolidation, re-ask and recall, through `memory` against the local database."""
 
+import logging
 import subprocess
 import sys
 import time
@@ -72,7 +73,7 @@ from golestan_code_mcp import server as srv  # noqa: E402
 
 HIT = dict(rank=1, score=40.0, similarity=0.6, keyword_rank=1, semantic_rank=2, repo="flask", kind="function",
            name="url_for", path="src/flask/helpers.py", start_line=188, end_line=246, language="python",
-           snippet="def url_for(...):")
+           snippet="def url_for(...):", relevance=40.0, feedback=0.0)
 FORBIDDEN = {"source", "snippet", "text"}
 
 
@@ -798,3 +799,82 @@ def test_names_from_the_source_sent_are_allowed_and_prose_is_not_a_name():
     # unpaired backticks: the prose between them is not a name, the code-shaped words still are
     assert memory.unknown_names("`get` method is defined in `app.py` as noted by `boom_now", {sent}) == ["app.py", "boom_now"]
     assert memory.unknown_names("It returns view_args via `--debug`.", {sent}) == ["view_args"]
+
+
+# --- usage feedback: the writer links uses to runs (specs/011-usage-feedback research R3) ---
+
+from golestan_code_mcp import feedback  # noqa: E402
+
+
+def a_use(name, symbol, run=None, how="cited", path="pkg/widgets.py"):
+    return {"use": {"repo": name, "path": path, "name": symbol, "kind": "function", "how": how, "client": "c",
+                    "session": uuid.uuid4().hex, "run": run}}
+
+
+def uses_of(conn, name):
+    memory.flush()
+    with conn.cursor() as cur:
+        cur.execute("select name, how, run_id from ccctx_feedback where repo_id = :r order by id",
+                    r=registry.repo_id(conn, name))
+        return cur.fetchall()
+
+
+def test_store_runs_gives_each_run_its_id(ready, repo):
+    name, _ = repo
+    runs = [synthetic(name, "search_code", "a", []), synthetic(name, "search_code", "b", [])]
+    memory.store_runs(ready, runs)
+    with ready.cursor() as cur:
+        newest = cur.execute("select max(id) from ccctx_memory_runs").fetchone()[0]
+    assert [r["id"] for r in runs] == [newest - 1, newest]
+
+
+def test_a_use_queued_after_its_run_is_linked_to_it(ready, repo):
+    name, _ = repo
+    run = synthetic(name, "search_code", "where is spin_widget", [hit(name, "spin_widget")])
+    memory.record(run)
+    memory.record(a_use(name, "spin_widget", run))
+    assert uses_of(ready, name) == [("spin_widget", "cited", run["id"])]
+
+
+def test_a_use_whose_run_was_never_written_is_unlinked(ready, repo):
+    name, _ = repo
+    memory.record(a_use(name, "spin_widget", synthetic(name, "search_code", "x", []), how="opened"))
+    memory.record(a_use(name, "turn_helper"))
+    assert uses_of(ready, name) == [("spin_widget", "opened", None), ("turn_helper", "cited", None)]
+
+
+def test_a_failing_use_is_logged_and_the_writer_goes_on(ready, repo, monkeypatch, caplog):
+    name, _ = repo
+
+    def broken(*_):
+        raise RuntimeError("no table")
+
+    write_use = feedback.write_use
+    monkeypatch.setattr(feedback, "write_use", broken)
+    with caplog.at_level(logging.WARNING, logger="golestan_code_mcp.memory"):
+        memory.record(a_use(name, "spin_widget"))
+        memory.flush()
+    monkeypatch.setattr(feedback, "write_use", write_use)
+    run = synthetic(name, "search_code", "after", [])
+    memory.record(run)
+    memory.flush()
+    assert [json.loads(r.getMessage()) for r in caplog.records if "feedback_record_failed" in r.getMessage()] == [
+        {"event": "feedback_record_failed", "reason": "no table"}]
+    assert run.get("id") and uses_of(ready, name) == []
+
+
+def test_runs_list_their_used_results_in_result_order(ready, repo):
+    name, _ = repo
+    run = synthetic(name, "search_code", "widgets", [hit(name, "spin_widget"), hit(name, "turn_helper"),
+                                                     hit(name, "Widget", kind="class")])
+    memory.record(run)
+    memory.record(a_use(name, "Widget", run))
+    memory.record(a_use(name, "spin_widget", run, how="opened"))
+    memory.flush()
+    [view] = [r for r in memory.runs(ready, name) if r.id == run["id"]]
+    assert view.used == ["spin_widget", "Widget"]
+    assert all(r.used == [] for r in memory.runs(ready, name) if r.id != run["id"])
+
+
+def test_mark_used_makes_no_fact():
+    assert "mark_used" in memory.NO_FACTS

@@ -30,8 +30,9 @@ SPECS = Path(__file__).resolve().parents[1] / "specs"
 CONTRACT = SPECS / "008-mcp-tools" / "contracts" / "tools.md"
 WIKI_CONTRACT = SPECS / "009-module-wiki" / "contracts" / "tools.md"
 MEMORY_CONTRACT = SPECS / "010-agent-memory" / "contracts" / "tools.md"
+FEEDBACK_CONTRACT = SPECS / "011-usage-feedback" / "contracts" / "tools.md"
 TOOLS = ["search_code", "get_symbol", "find_callers", "find_callees", "impact_of", "read_wiki", "list_repositories",
-         "recall"]
+         "recall", "mark_used"]
 FACT_SENTENCE = ("A hit of kind fact is something an earlier session worked out about the code at its path; recall "
                  "lists all of them.")
 
@@ -81,6 +82,19 @@ def contract():
         cells = [c.strip() for c in re.split(r"(?<!\\)\|", line)]
         if len(cells) == 5 and cells[1].startswith("`"):
             params[("recall", cells[1].strip("`"))] = cells[3]
+    feedback_text = FEEDBACK_CONTRACT.read_text(encoding="utf-8")
+    tools |= dict(re.findall(r"^\*\*`(mark_used)`\*\*: (.+)$", feedback_text, re.MULTILINE))
+    scores, added = (re.search(rf'^{k}: "(.+)"$', feedback_text, re.MULTILINE).group(1) for k in ("Scores", "Added"))
+    old_scores = ("the scores behind its rank: the fused score, the keyword rank and the semantic rank (null when that "
+                  "side did not find it).")
+    assert old_scores in tools["search_code"]
+    tools["search_code"] = tools["search_code"].replace(old_scores, f"{scores} {added}")
+    for section, tool in (("## `mark_used`", "mark_used"), ("## `search_code`", "search_code")):
+        table = feedback_text.split(section, 1)[1].split("| Parameter | Type | Description |", 1)[1].split("\n\n", 1)[0]
+        for line in table.splitlines():
+            cells = [c.strip() for c in line.split("|")]
+            if len(cells) == 5 and cells[1].startswith("`"):
+                params[(tool, cells[1].strip("`"))] = cells[3]
     return tools, params
 
 
@@ -90,19 +104,19 @@ def instructions():
     return " ".join(line[2:].strip() for line in section.splitlines() if line.startswith("> "))
 
 
-def test_lists_the_eight_tools_as_the_contract_describes_them():
+def test_lists_the_nine_tools_as_the_contract_describes_them():
     tools = listed()
     assert list(tools) == TOOLS
     descriptions, params = contract()
     for name, tool in tools.items():
         assert tool.description == descriptions[name], name
-        assert tool.annotations.readOnlyHint is True
+        assert tool.annotations.readOnlyHint is (name != "mark_used")
         assert tool.inputSchema.get("additionalProperties") is False
         for param, spec in tool.inputSchema.get("properties", {}).items():
             assert spec["description"] == params[(name, param)], (name, param)
     shape = {n: (list(t.inputSchema.get("properties", {})), t.inputSchema.get("required", [])) for n, t in tools.items()}
     assert shape == {
-        "search_code": (["query", "repo", "language", "limit"], ["query"]),
+        "search_code": (["query", "repo", "language", "limit", "feedback"], ["query"]),
         "get_symbol": (["name", "repo"], ["name"]),
         "find_callers": (["name", "repo"], ["name"]),
         "find_callees": (["name", "repo"], ["name"]),
@@ -110,7 +124,11 @@ def test_lists_the_eight_tools_as_the_contract_describes_them():
         "read_wiki": (["page", "repo"], []),
         "list_repositories": ([], []),
         "recall": (["repo", "topic", "limit"], []),
+        "mark_used": (["repo", "path", "name"], ["repo", "path", "name"]),
     }
+    marks = tools["mark_used"].annotations
+    assert (marks.idempotentHint, marks.destructiveHint) == (True, False)
+    assert tools["search_code"].inputSchema["properties"]["feedback"]["default"] is True
     assert tools["recall"].inputSchema["properties"]["limit"]["default"] == 20
     assert tools["search_code"].inputSchema["properties"]["limit"]["default"] == 10
     assert tools["impact_of"].inputSchema["properties"]["depth"]["default"] == 3
@@ -476,8 +494,11 @@ def as_client(tool, **arguments):
 
 
 @pytest.fixture
-def recorded(real_recording):
-    """(conn, newest run id before the test). Runs are read back after memory.flush(). Records for real."""
+def recorded(real_recording, monkeypatch):
+    """(conn, newest run id before the test). Runs are read back after memory.flush(). Records for real.
+
+    Starts with no results returned: other tests' flask searches must not turn this test's reads into uses."""
+    monkeypatch.setattr(server, "_returned", {})
     try:
         conn = db.connect(load())
     except Exception:
@@ -638,3 +659,146 @@ def test_recording_adds_no_visible_delay(recorded, monkeypatch):
     monkeypatch.setattr(memory, "record", lambda run: None)
     without = median_ms()
     assert with_recording <= without * 1.05 + 0.010
+
+
+# --- usage feedback (specs/011-usage-feedback contracts/tools.md) -----------------------------------------------
+
+from golestan_code_mcp import feedback  # noqa: E402
+
+
+@pytest.fixture(scope="module")
+def used_repo(tmp_path_factory):
+    """A `t-` repository with one wiki page, `pkg`, and its symbols post0 to post9 in src/pkg/core.py."""
+    conn = ready()
+    with conn:
+        schema.migrate(conn)
+        name = wiki_repo(conn, tmp_path_factory.mktemp("u"))
+        yield name
+        with conn.cursor() as cur:
+            cur.execute("delete from ccctx_repos where name = :n", n=name)
+        conn.commit()
+
+
+@pytest.fixture
+def fresh_session(recorded, used_repo, monkeypatch):
+    """A new server session over the `t-` repository: no results returned yet, its own session id, no uses."""
+    conn, _ = recorded
+    monkeypatch.setattr(server, "_returned", {})
+    monkeypatch.setattr(server, "SESSION", uuid.uuid4().hex)
+    with conn.cursor() as cur:
+        cur.execute("delete from ccctx_feedback where repo_id = :r", r=registry.repo_id(conn, used_repo))
+    conn.commit()
+    return used_repo
+
+
+def uses(conn, repo):
+    memory.flush()
+    with conn.cursor() as cur:
+        cur.execute("""select f.name, f.path, f.kind, f.how, f.run_id, f.client from ccctx_feedback f
+                        where f.repo_id = :r order by f.id""", r=registry.repo_id(conn, repo))
+        return cur.fetchall()
+
+
+def newest_run(conn, tool):
+    memory.flush()
+    with conn.cursor() as cur:
+        return cur.execute("select max(id) from ccctx_memory_runs where tool = :t", t=tool).fetchone()[0]
+
+
+def search_hit(repo, name):
+    out = as_client("search_code", query="post entry for the demo ledger", repo=repo, limit=20).structuredContent
+    return next(h for h in out["results"] if h["name"] == name)
+
+
+def test_mark_used_after_a_search_is_linked(recorded, fresh_session):
+    conn, _ = recorded
+    hit = search_hit(fresh_session, "post3")
+    out = as_client("mark_used", repo=fresh_session, path=hit["path"], name="post3").structuredContent
+    assert out == {"status": "ok", "reason": None, "repo": fresh_session, "path": hit["path"], "name": "post3",
+                   "kind": "function", "linked": True}
+    assert uses(conn, fresh_session) == [("post3", hit["path"], "function", "cited", newest_run(conn, "search_code"),
+                                          "test-client 9.9")]
+
+
+def test_mark_used_without_a_search_is_unlinked(recorded, fresh_session):
+    conn, _ = recorded
+    out = as_client("mark_used", repo=fresh_session, path="src/pkg/core.py", name="post1").structuredContent
+    assert out["status"] == "ok" and out["linked"] is False
+    assert [(n, how, run) for n, _, _, how, run, _ in uses(conn, fresh_session)] == [("post1", "cited", None)]
+
+
+@pytest.mark.parametrize("arguments", [
+    {"path": "src/pkg/core.py", "name": "no_such_post"},
+    {"path": "src/pkg/other.py", "name": "post1"},
+])
+def test_mark_used_on_nothing_records_nothing(recorded, fresh_session, arguments):
+    conn, _ = recorded
+    out = as_client("mark_used", repo=fresh_session, **arguments).structuredContent
+    assert out["status"] == "unavailable" and out["reason"].startswith("not found: ") and out["kind"] is None
+    assert out["linked"] is False and uses(conn, fresh_session) == []
+
+
+def test_mark_used_unknown_repository(recorded):
+    out = as_client("mark_used", repo="t-nowhere", path="a.py", name="f").structuredContent
+    assert out["status"] == "unavailable" and out["reason"] == "no repository named 't-nowhere'"
+
+
+def test_reading_a_returned_hit_is_an_opened_use(recorded, fresh_session):
+    conn, _ = recorded
+    out = as_client("search_code", query="post entry for the demo ledger", repo=fresh_session, limit=20)
+    returned = {h["name"] for h in out.structuredContent["results"]}
+    run = newest_run(conn, "search_code")
+    assert as_client("get_symbol", name="post5", repo=fresh_session).structuredContent["status"] == "ok"
+    assert as_client("read_wiki", page="pkg", repo=fresh_session).structuredContent["status"] == "ok"
+    expected = [("post5", "src/pkg/core.py", "function", "opened", run, "test-client 9.9")]
+    if "pkg" in returned:  # the page is an opened use only when the search returned it
+        expected.append(("pkg", "src/pkg", "page", "opened", run, "test-client 9.9"))
+    assert uses(conn, fresh_session) == expected
+
+
+def test_reading_without_a_search_is_not_a_use(recorded, fresh_session):
+    conn, _ = recorded
+    as_client("get_symbol", name="post5", repo=fresh_session)
+    as_client("read_wiki", page="pkg", repo=fresh_session)
+    assert uses(conn, fresh_session) == []
+
+
+def test_opened_then_cited_is_one_cited_use(recorded, fresh_session):
+    conn, _ = recorded
+    hit = search_hit(fresh_session, "post7")
+    as_client("get_symbol", name="post7", repo=fresh_session)
+    as_client("mark_used", repo=fresh_session, path=hit["path"], name="post7")
+    as_client("mark_used", repo=fresh_session, path=hit["path"], name="post7")
+    assert [(n, how) for n, _, _, how, _, _ in uses(conn, fresh_session)] == [("post7", "cited")]
+
+
+def test_a_use_recording_failure_leaves_the_answer_alone(recorded, fresh_session, monkeypatch, caplog):
+    conn, _ = recorded
+    expected = as_client("mark_used", repo=fresh_session, path="src/pkg/core.py", name="post2").structuredContent
+    memory.flush()
+
+    def broken(*_):
+        raise RuntimeError("feedback down")
+
+    monkeypatch.setattr(feedback, "write_use", broken)
+    with caplog.at_level(logging.WARNING, logger="golestan_code_mcp.memory"):
+        out = as_client("mark_used", repo=fresh_session, path="src/pkg/core.py", name="post4").structuredContent
+        memory.flush()
+    assert out == expected | {"name": "post4"}
+    failures = [json.loads(r.getMessage()) for r in caplog.records if "feedback_record_failed" in r.getMessage()]
+    assert failures == [{"event": "feedback_record_failed", "reason": "feedback down"}]
+    assert [n for n, *_ in uses(conn, fresh_session)] == ["post2"]
+
+
+def test_search_hits_carry_relevance_and_feedback(fresh_session):
+    on = call("search_code", query="post entry for the demo ledger", repo=fresh_session)["results"]
+    off = call("search_code", query="post entry for the demo ledger", repo=fresh_session, feedback=False)["results"]
+    assert on and all(0 <= h["feedback"] <= 0.2 for h in on)
+    assert all(h["score"] == pytest.approx(h["relevance"] * (1 + h["feedback"])) for h in on)
+    assert all(h["feedback"] == 0 for h in off)
+
+
+def test_search_with_feedback_off_matches_the_core(fresh_session):
+    with db.connect(load()) as conn:
+        expected = [vars(r) for r in semantic.search(conn, "post entry", [fresh_session], feedback=False)]
+    assert call("search_code", query="post entry", repo=fresh_session, feedback=False)["results"] == expected

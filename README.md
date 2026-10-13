@@ -173,10 +173,10 @@ uv run ccctx search "middleware chain" --language go --limit 3      # one langua
 ```
 
 ```text
-RANK  SCORE  KEYWORD  SEMANTIC  REPO   KIND      NAME           PATH                     LINES
-   1  24.38        5         4  flask  method    Flask.url_for  src/flask/app.py         1102-1222
-   2  21.82        6         7  flask  function  url_for        src/flask/helpers.py     200-251
-   4  29.69        1        11  flask  class     TestUrlFor     tests/test_helpers.py    94-161
+RANK  SCORE  FEEDBACK  KEYWORD  SEMANTIC  REPO   KIND      NAME           PATH                     LINES
+   1  24.38                  5         4  flask  method    Flask.url_for  src/flask/app.py         1102-1222
+   2  21.82                  6         7  flask  function  url_for        src/flask/helpers.py     200-251
+   4  29.69                  1        11  flask  class     TestUrlFor     tests/test_helpers.py    94-161
 ```
 
 Modes, chosen with `--mode`:
@@ -191,7 +191,8 @@ How results are ranked:
 - **Similarity floor**: a result found only by meaning must have a cosine similarity of at least 0.3, so an unrelated question returns nothing rather than ten weak matches. Keyword matches always count.
 - **One window per file**: of a file's fallback line windows, only the best one is shown.
 - **10 results by default**, `--limit` 1 to 50. `--language` keeps one language (`python`, `go`, `javascript`, `markdown` and the other languages the chunker assigns). Query text is always taken literally: `_`, `-`, `&`, quotes and parentheses are never search operators.
-- **Why each result ranked**: `SCORE` is the fused score (or the single side's score in `text` and `vector` mode). `KEYWORD` and `SEMANTIC` are its rank on each side among the repositories searched, with `-` when that side did not find it.
+- **Usage feedback**: results that clients used get a small boost, at most 20%, that fades over 30 days (see Usage feedback). `--no-feedback` ranks without it.
+- **Why each result ranked**: `SCORE` is the fused score (or the single side's score in `text` and `vector` mode), raised by `FEEDBACK` when the result was used (`+4%`; blank when there is none). `KEYWORD` and `SEMANTIC` are its rank on each side among the repositories searched, with `-` when that side did not find it.
 
 Fusion settings:
 
@@ -413,6 +414,69 @@ the call fails, the template writes the fact. Each fact records which one wrote 
 **Removing a repository.** There is no `repo remove` command yet. When one is added, it must call `memory.forget`,
 which deletes the repository's facts. Runs that belonged only to it are deleted by the next consolidation.
 
+## Usage feedback
+
+The server learns which results helped, and lets that nudge later searches without ever overruling relevance.
+
+**What counts as a use.** A client calls `mark_used` with a hit's repository, path and name when it cites the hit or
+relies on it: a **cited** use. Reading a hit that this session's `search_code` returned, with `get_symbol` or
+`read_wiki`, is an **opened** use. A result gets at most one use per session; citing it after opening it leaves one
+cited use. Each use is linked to the search that returned it, so `ccctx memory list` shows `RESULTS` as
+`used/returned` (`2/10`). A use is keyed by the result's repository, path and name, so it survives a re-ingest, and it
+is recorded on the same background thread as runs: it never delays or changes an answer.
+
+**Weight and decay.** A cited use weighs 1 and an opened use 0.5. A use's weight halves every 30 days: 1.00 today,
+0.50 after 30 days, 0.25 after 60. A result's weight is the sum over its uses.
+
+**The boost.** `boost = cap * min(1, weight / 5)`: 4% per fresh citation, up to the cap at a weight of 5. A result's
+score becomes `relevance * (1 + boost)`. The boost only reorders what the search already found: it never adds a
+result, identifier definitions still come first, a page's similarity is raised the same way when it is placed, and
+facts are never boosted. A result 20% or more behind another can never pass it, so a heavily used symbol does not
+take over unrelated questions.
+
+| Setting | Default | Meaning |
+|---|---|---|
+| `CCCTX_FEEDBACK_CAP` | `0.2` | The largest boost, 0 to 1. `0` switches feedback off. |
+| `CCCTX_FEEDBACK_HALF_LIFE_DAYS` | `30` | Days after which a use counts half as much |
+
+```sh
+uv run ccctx feedback list --repo flask                                          # weight and boost per result
+uv run ccctx feedback add url_for --repo flask --path src/flask/helpers.py       # record a cited use by hand
+uv run ccctx feedback add redirect --repo flask --days-ago 30 --count 3          # backdated, several
+uv run ccctx feedback reset --repo flask                                         # or --all
+```
+
+```text
+KIND      NAME      PATH                  USES  WEIGHT  BOOST  LAST USED            INDEXED
+function  url_for   src/flask/helpers.py     1    1.00   +4%  2026-10-13 09:12:40  yes
+function  redirect  src/flask/helpers.py     3    1.50   +6%  2026-09-13 09:12:41  yes
+```
+
+`INDEXED` is `no` when the symbol or page is gone; such a use boosts nothing. `--path` is needed when the name is at
+several paths. Feedback never changes the index.
+
+## Evaluating retrieval
+
+`gold.json` is a versioned set of 20 plain-language questions about flask and gin, each with the files or
+directories that answer it. `ccctx eval` runs them and counts a question as a hit when any of its top 10 results is at
+an expected path (a directory matches the files under it):
+
+```sh
+uv run ccctx eval --gold gold.json                  # ranking without feedback
+uv run ccctx eval --gold gold.json --with-feedback  # with it: should hold or improve recall
+```
+
+```text
+Questions: 20
+recall@10: 0.90 (18/20)
+missed: how do tests send requests to the app without running a server?
+missed: how is HTTP basic authentication checked?
+```
+
+`--limit` changes the 10. Evaluating records no run and no use. The format is
+`{"version": 1, "questions": [{"question": "...", "repo": "flask", "paths": ["src/flask/app.py"]}]}`; `repo` is
+optional. Bump `version` when the questions or paths change. `tests/test_eval.py` keeps the baseline as a floor.
+
 ## Checking that data persists
 
 `uv run pytest` adds a row to the `ccctx_smoke` table on each run. Note the count, restart the container, and check it again:
@@ -438,11 +502,11 @@ uv tool install --editable .
 
 The editable install keeps `.env` in reach. With a non-editable install there is no `.env` next to the package, so give the settings to the client instead: `claude mcp add ccctx -e DB_USER=... -e DB_PASSWORD=... -- ccctx mcp`.
 
-**Tools.** Each tool's description says what it answers and when to use one of the others instead. They are all read-only.
+**Tools.** Each tool's description says what it answers and when to use one of the others instead. All but `mark_used` are read-only.
 
 | Tool | Parameters | Returns |
 |---|---|---|
-| `search_code` | `query`, `repo`, `language`, `limit` (default 10, 1 to 50) | Hits with repository, path, symbol name, kind, language, line range, a snippet (the first 10 lines, at most 800 characters) and the fused, keyword and semantic scores. The same hits as `ccctx search`, wiki pages included: a page hit has kind `page`, a `state`, its directory as `path` and a null line range. A fact hit has kind `fact`, its subject as the name, the subject's location, and the fact's text as the snippet. |
+| `search_code` | `query`, `repo`, `language`, `limit` (default 10, 1 to 50), `feedback` (default true) | Hits with repository, path, symbol name, kind, language, line range, a snippet (the first 10 lines, at most 800 characters) and the scores: `score`, `relevance` (the score before feedback), `feedback` (the boost, 0 to 0.2), and the keyword and semantic ranks. `feedback: false` ranks without usage feedback. The same hits as `ccctx search`, wiki pages included: a page hit has kind `page`, a `state`, its directory as `path` and a null line range. A fact hit has kind `fact`, its subject as the name, the subject's location, and the fact's text as the snippet. |
 | `get_symbol` | `name`, `repo` | Up to 5 definitions with that name, each with its full indexed source, path and line range. A source over 400 lines is cut and marked `cut`. `total` and `truncated` say whether more matched. |
 | `find_callers` | `name`, `repo` | The rows of `ccctx callers`. |
 | `find_callees` | `name`, `repo` | The rows of `ccctx calls`. |
@@ -450,6 +514,7 @@ The editable install keeps `.env` in reach. With a non-editable install there is
 | `read_wiki` | `page`, `repo` | With `page`: the page's text, state, compile time and compiler, and its citations, each with repository, path and line range, the same as `ccctx wiki show`. Without `page`: the pages with their state and first purpose sentence, at most 200. |
 | `list_repositories` | none | The registered repositories, the same as `ccctx repo list`. |
 | `recall` | `repo`, `topic`, `limit` (default 20, 1 to 50) | What earlier sessions worked out: the facts, fresh and most confident first or most related to `topic`, each with its text, confidence, state, run IDs and the location of its code, and the 10 newest runs. Never calls a model. |
+| `mark_used` | `repo`, `path`, `name` (all required) | Records that a hit helped (a cited use, see Usage feedback). Returns the result's `kind` and `linked`: whether a search in this session returned it. An unknown result is `unavailable` with `not found`. Idempotent. |
 
 - **Names** work as in the graph commands: a bare `url_for` matches every `url_for`, and `Flask.url_for` only that method.
 - **Limits:** the graph tools return at most 200 rows, with `truncated` set when there were more.
@@ -457,6 +522,10 @@ The editable install keeps `.env` in reach. With a non-editable install there is
 - **Logging:** each call writes one line to standard error with the tool, time, status and result count.
 - **Memory:** each call is also recorded as a run (see Agent memory). The server's instructions tell clients to call
   `recall` first.
+
+**Changed in 1.3.0.** `mark_used` is new. `search_code` hits have `relevance` and `feedback`, `score` includes the
+feedback boost, and `search_code` takes `feedback`. `get_symbol` and `read_wiki` record opened uses; their answers
+are unchanged. Nothing was removed or renamed.
 
 **Changed in 1.2.0.** `recall` is new, `search_code` can return `fact` hits, and the server sends instructions.
 Nothing was removed or renamed.
@@ -512,7 +581,9 @@ src/golestan_code_mcp/    config, db check, sample cloner, MCP server
   graph.py                call and import edges from stored refs; callers, calls, impact via GRAPH_TABLE; definitions
   wiki.py                 module pages from the index: compile, cite, mark stale, recompile, read
   memory.py               agent memory: record runs, distil facts, re-check, recall, fact hits in search
-  server.py               the eight MCP tools (`ccctx mcp`)
+  feedback.py             usage feedback: uses, weights and decay, the bounded boost, the gold evaluation
+  server.py               the nine MCP tools (`ccctx mcp`)
   cli.py                  the ccctx command
 tests/                    pytest suite and chunker fixtures
+gold.json                 the retrieval evaluation set (`ccctx eval`)
 ```

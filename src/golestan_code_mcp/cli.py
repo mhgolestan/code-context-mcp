@@ -9,7 +9,7 @@ from datetime import UTC
 
 import oracledb
 
-from golestan_code_mcp import db, graph, ingest, memory, registry, schema, semantic, wiki
+from golestan_code_mcp import db, feedback, graph, ingest, memory, registry, schema, semantic, wiki
 from golestan_code_mcp.config import environment, load
 
 SKIP_ORDER = ["ignored", "vendored", "binary", "too large"]
@@ -161,16 +161,21 @@ def _dash(rank: int | None):
 
 def _search(conn, args) -> str:
     results = semantic.search(conn, args.question, _repos(args.repo), args.mode, environment(), args.language,
-                              args.limit)
+                              args.limit, feedback=not args.no_feedback)
     if not results:
         if args.mode == "vector":
             return f"no symbols similar enough (similarity >= {semantic.FLOOR:.2f})"
         return "no matching symbols"
-    rows = [(r.rank, f"{r.score:.2f}", _dash(r.keyword_rank), _dash(r.semantic_rank), r.repo,
+    rows = [(r.rank, f"{r.score:.2f}", _percent(r.feedback) if r.feedback else "", _dash(r.keyword_rank),
+             _dash(r.semantic_rank), r.repo,
              f"{r.kind} (stale)" if r.state == "stale" else r.kind, r.name, r.path,
              "-" if r.start_line is None else f"{r.start_line}-{r.end_line}") for r in results]
-    header = ("RANK", "SCORE", "KEYWORD", "SEMANTIC", "REPO", "KIND", "NAME", "PATH", "LINES")
-    return format_table(header, rows, frozenset({0, 1, 2, 3}))
+    header = ("RANK", "SCORE", "FEEDBACK", "KEYWORD", "SEMANTIC", "REPO", "KIND", "NAME", "PATH", "LINES")
+    return format_table(header, rows, frozenset({0, 1, 2, 3, 4}))
+
+
+def _percent(boost: float) -> str:
+    return f"+{round(boost * 100)}%"
 
 
 def _callers(conn, args) -> str:
@@ -269,8 +274,8 @@ def _memory_list(conn, args) -> str:
     found = memory.runs(conn, args.repo, args.limit)
     if not found:
         return "no runs recorded"
-    rows = [(r.id, _when(r.called_at), r.tool, (r.question or "").strip() or "-", r.client or "-", r.status, r.result_count,
-             _top(r))
+    rows = [(r.id, _when(r.called_at), r.tool, (r.question or "").strip() or "-", r.client or "-", r.status,
+             f"{len(r.used)}/{r.result_count}" if r.used else r.result_count, _top(r))
             for r in found]
     return format_table(("RUN", "WHEN", "TOOL", "QUESTION", "CLIENT", "STATUS", "RESULTS", "TOP"), rows,
                         frozenset({0, 6}))
@@ -305,6 +310,33 @@ def _memory_facts(conn, args) -> str:
     return format_table(("FACT", "REPO", "SUBJECT", "CONFIDENCE", "STATE", "DISTILLER", "RUNS", "TEXT"), rows)
 
 
+def _feedback_list(conn, args) -> str:
+    rows = feedback.listing(conn, args.repo)
+    if not rows:
+        return f"no feedback recorded for {args.repo}"
+    return format_table(("KIND", "NAME", "PATH", "USES", "WEIGHT", "BOOST", "LAST USED", "INDEXED"), [
+        (r.kind, r.name, r.path, r.uses, f"{r.weight:.2f}", _percent(r.boost), _when(r.last_used),
+         "yes" if r.indexed else "no") for r in rows], frozenset({3, 4, 5}))
+
+
+def _feedback_add(conn, args) -> str:
+    path, _ = feedback.add(conn, args.repo, args.name, args.path, args.days_ago, args.count)
+    uses = "use" if args.count == 1 else "uses"
+    return f"recorded {args.count} {uses} of {args.name} ({path}) in {args.repo}, dated {args.days_ago} days ago"
+
+
+def _feedback_reset(conn, args) -> str:
+    deleted = feedback.reset(conn, None if args.all else args.repo)
+    return f"deleted {deleted} uses in {'all repositories' if args.all else args.repo}"
+
+
+def _eval(conn, args) -> str:
+    gold = feedback.load_gold(args.gold, conn)
+    e = feedback.evaluate(conn, gold, args.with_feedback, args.limit)
+    return "\n".join([f"Questions: {e.questions}", f"recall@{args.limit}: {e.recall:.2f} ({e.hits}/{e.questions})",
+                      *(f"missed: {q}" for q in e.missed)])
+
+
 def _db_migrate(conn, args) -> str:
     applied = schema.migrate(conn)
     names = {v: n for v, n, _ in schema.MIGRATIONS}
@@ -316,6 +348,24 @@ def _db_migrate(conn, args) -> str:
 def _positive(text: str) -> int:
     if not text.isdigit() or int(text) < 1:
         raise argparse.ArgumentTypeError("must be a positive integer")
+    return int(text)
+
+
+def _not_negative(text: str) -> int:
+    if not text.isdigit():
+        raise argparse.ArgumentTypeError("must be a whole number of days, 0 or more")
+    return int(text)
+
+
+def _count(text: str) -> int:
+    if not text.isdigit() or not 1 <= int(text) <= 100000:
+        raise argparse.ArgumentTypeError("must be from 1 to 100000")
+    return int(text)
+
+
+def _eval_limit(text: str) -> int:
+    if not text.isdigit() or not 1 <= int(text) <= semantic.MAX_LIMIT:
+        raise argparse.ArgumentTypeError(f"must be from 1 to {semantic.MAX_LIMIT}")
     return int(text)
 
 
@@ -352,6 +402,7 @@ def parser() -> argparse.ArgumentParser:
     srch.add_argument("--repo", action="append", help="limit to these repositories; repeat or comma-separate")
     srch.add_argument("--language", help="limit to files of this language")
     srch.add_argument("--limit", default="10", help=f"hits to return, 1 to {semantic.MAX_LIMIT} (default 10)")
+    srch.add_argument("--no-feedback", action="store_true", help="rank without usage feedback")
     srch.set_defaults(run=_search)
 
     for run, cmd, text in [(_callers, "callers", "list every call to a symbol"),
@@ -387,6 +438,28 @@ def parser() -> argparse.ArgumentParser:
     mf.add_argument("--repo")
     mf.add_argument("--limit", type=_positive, default=20)
     mf.set_defaults(run=_memory_facts)
+    fb = groups.add_parser("feedback", help="which results clients used, and the boost it earns").add_subparsers(
+        dest="cmd", required=True)
+    fl = fb.add_parser("list", help="list results with uses, highest weight first")
+    fl.add_argument("--repo", required=True)
+    fl.set_defaults(run=_feedback_list)
+    fa = fb.add_parser("add", help="record cited uses of an indexed symbol or page by hand")
+    fa.add_argument("name")
+    fa.add_argument("--repo", required=True)
+    fa.add_argument("--path", help="the symbol's file or the page's directory; needed when the name is at several")
+    fa.add_argument("--days-ago", type=_not_negative, default=0, help="date the uses this many days back (default 0)")
+    fa.add_argument("--count", type=_count, default=1, help="how many uses, 1 to 100000 (default 1)")
+    fa.set_defaults(run=_feedback_add)
+    fr = fb.add_parser("reset", help="delete uses")
+    scope = fr.add_mutually_exclusive_group(required=True)
+    scope.add_argument("--repo")
+    scope.add_argument("--all", action="store_true", help="every repository's uses")
+    fr.set_defaults(run=_feedback_reset)
+    ev = groups.add_parser("eval", help="recall of a gold set of questions and expected paths")
+    ev.add_argument("--gold", required=True, help="the gold file, for example gold.json")
+    ev.add_argument("--with-feedback", action="store_true", help="rank with usage feedback (default: without)")
+    ev.add_argument("--limit", type=_eval_limit, default=10, help="hits per question to look at (default 10)")
+    ev.set_defaults(run=_eval)
     model = groups.add_parser("model", help="embedding model").add_subparsers(dest="cmd", required=True)
     model.add_parser("load", help="download once and load the embedding model").set_defaults(run=_model_load)
 

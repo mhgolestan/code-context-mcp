@@ -905,3 +905,26 @@ def test_eval_bad_limit_exits_2(capsys, limit):
     with pytest.raises(SystemExit) as exit_:
         cli.main(["eval", "--gold", "gold.json", "--limit", limit])
     assert exit_.value.code == 2
+
+
+# --- language coverage (012, US3): the Reparsed line ---
+
+
+def test_incremental_summary_reports_reparsed_files():
+    s = replace(summary(parse_errors=1, files=48, symbols=412), mode="incremental", added=0, changed=48, removed=0,
+                unchanged=51, reparsed=Counter(typescript=2, csharp=46))
+    assert cli.format_summary(s).splitlines() == [
+        "Changed    48 files (0 added, 48 changed, 0 removed)",
+        "Unchanged  51 files",
+        "Skipped     0 files",
+        "Indexed   412 symbols in 9.2s",
+        "Reparsed   48 files whose language is now understood (46 csharp, 2 typescript)",
+        "Fallback    1 files as line windows (0 no grammar, 1 parse errors)",
+    ]
+    tie = replace(s, reparsed=Counter(rust=1, java=1))
+    assert "(1 java, 1 rust)" in cli.format_summary(tie)
+
+
+def test_no_reparsed_line_without_reparsed_files():
+    s = replace(summary(files=8, symbols=84), mode="incremental", added=2, changed=6, removed=0, unchanged=227)
+    assert not any(line.startswith("Reparsed") for line in cli.format_summary(s).splitlines())

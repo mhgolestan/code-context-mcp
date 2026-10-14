@@ -35,7 +35,9 @@ MAX_CITATIONS = 200
 TYPES = ("class", "interface", "type")
 ROLES = ("key", "file", "depends", "uses", "calls")  # the citation order
 SYMBOL_ROLES = ("key", "calls")
-LANGUAGE_NAMES = {"python": "Python", "go": "Go", "javascript": "JavaScript"}
+LANGUAGE_NAMES = {"python": "Python", "go": "Go", "javascript": "JavaScript", "csharp": "C#",
+                  "typescript": "TypeScript", "tsx": "TSX", "c": "C", "cpp": "C++", "java": "Java", "kotlin": "Kotlin",
+                  "rust": "Rust", "php": "PHP", "ruby": "Ruby", "swift": "Swift"}
 NO_DOC = "Its code has no documentation; the sections below come from its structure."
 
 SENTENCE_END = re.compile(r"(?<=[.!?])\s+")
@@ -118,7 +120,7 @@ class _Index:
     repo: str
     commit: str
     files: dict[int, tuple]  # id -> (path, language, doc, content_hash)
-    symbols: dict[int, tuple]  # id -> (file id, name, kind, doc, commit_sha, content_hash), named definitions only
+    symbols: dict[int, tuple]  # id -> (file id, name, kind, doc, commit_sha, content_hash, exported), named only
     calls: list[tuple[int, int]]  # (calling file id, callee symbol id), one per call edge
     imports: list[tuple[int, int]]  # (importer file id, imported file id)
     external: dict[int, set[str]]
@@ -194,7 +196,8 @@ def _load(cur, repo_id: int, repo: str) -> _Index:
         {fid: rest for fid, *rest in cur.execute(
             "select id, path, language, doc, content_hash from ccctx_files where repo_id = :r", r)},
         {sid: tuple(rest) for sid, *rest in cur.execute(
-            "select s.id, s.file_id, s.name, s.kind, s.doc, s.commit_sha, s.content_hash from ccctx_symbols s"
+            "select s.id, s.file_id, s.name, s.kind, s.doc, s.commit_sha, s.content_hash, s.exported"
+            " from ccctx_symbols s"
             " join ccctx_files f on f.id = s.file_id where f.repo_id = :r and s.kind <> 'chunk'", r)},
         cur.execute(
             "select s.file_id, c.callee_id from ccctx_calls c join ccctx_symbols s on s.id = c.caller_id"
@@ -240,7 +243,7 @@ def _ticked(names) -> str:
 
 
 def _symbol_citation(index: _Index, role: str, sid: int) -> dict:
-    _, name, kind, _, commit, digest = index.symbols[sid]
+    _, name, kind, _, commit, digest, _ = index.symbols[sid]
     return {"s": sid, "f": None, "role": role, "name": name, "kind": kind, "sha": commit, "hash": digest}
 
 
@@ -249,9 +252,15 @@ def _file_citation(index: _Index, role: str, fid: int) -> dict:
     return {"s": None, "f": fid, "role": role, "name": path, "kind": "file", "sha": index.commit, "hash": digest}
 
 
+TEST_SUFFIXES = ("_test.go", "_test.py", "Test.cs", "Tests.cs", ".test.ts", ".test.tsx", ".spec.ts", ".spec.tsx",
+                 "_test.c", "_test.cpp", "Test.java", "Tests.java", "Test.kt", "Tests.kt", "Test.php", "_test.rb", "_spec.rb",
+                 "Tests.swift")  # a language's test files, ranked last (012 R11)
+
+
 def _is_test(path: str) -> bool:
     base = posixpath.basename(path)
-    return base.startswith("test_") or base.endswith(("_test.go", "_test.py")) or base == "conftest.py"
+    return (base.startswith("test_") or base.endswith(TEST_SUFFIXES) or base == "conftest.py"
+            or (base.endswith(".rs") and "tests" in path.split("/")[:-1]))  # Rust integration tests
 
 
 def _page(index: _Index, directory: str) -> _Draft:
@@ -268,7 +277,9 @@ def _page(index: _Index, directory: str) -> _Draft:
 
     def rank(s):  # code before its tests, then what other modules call, then what is exported and documented
         short = sym[s][1].rpartition(".")[2]
-        exported = short[:1].isupper() if language == "go" else not short.startswith("_")
+        exported = sym[s][6]  # set at parse time by the symbol's own language (012 research R9)
+        if exported is None:  # simplified: rows from before migration 10's backfill
+            exported = short[:1].isupper() if language == "go" else not short.startswith("_")
         return (_is_test(index.files[sym[s][0]][0]), -index.outside[s], not exported, not sym[s][3],
                 -index.total[s], sym[s][1])
 

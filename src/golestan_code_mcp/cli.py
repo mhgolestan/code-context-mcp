@@ -78,6 +78,9 @@ def _format_incremental(s: ingest.Summary) -> str:
         ("Skipped", sum(s.skipped.values()), " files" + (f" ({reasons})" if reasons else "")),
         ("Indexed", s.symbols, f" symbols in {s.seconds:.1f}s"),
     ]
+    if s.reparsed:  # files read again only because their language gained rules (012 contracts/cli.md)
+        by = ", ".join(f"{n} {lang}" for lang, n in sorted(s.reparsed.items(), key=lambda kv: (-kv[1], kv[0])))
+        rows.append(("Reparsed", s.reparsed.total(), f" files whose language is now understood ({by})"))
     if s.no_grammar or s.parse_errors:
         rows.append(("Fallback", s.no_grammar + s.parse_errors,
                      f" files as line windows ({s.no_grammar} no grammar, {s.parse_errors} parse errors)"))

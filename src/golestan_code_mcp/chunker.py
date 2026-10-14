@@ -1,21 +1,22 @@
 """Chunker: split file text into definition-level chunks with tree-sitter, or into line windows.
 
 The same parse also yields the calls and imports each file makes, for the code graph, and the documentation of
-each definition and of the file, for the module wiki."""
+each definition and of the file, for the module wiki. Python, Go and JavaScript are defined here; the other languages
+(specs/012-language-coverage) live in languages.py and are merged into these tables at the end of this module."""
 
+import importlib
 import re
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from dataclasses import dataclass
 from functools import cache
 from pathlib import PurePath
 from typing import NamedTuple
 
-import tree_sitter_go
-import tree_sitter_javascript
-import tree_sitter_python
 from tree_sitter import Language, Node, Parser
 
-GRAMMARS = {"python": tree_sitter_python, "go": tree_sitter_go, "javascript": tree_sitter_javascript}
+# language -> (grammar module, function returning its language), imported on the first file of that language
+GRAMMARS = {"python": ("tree_sitter_python", "language"), "go": ("tree_sitter_go", "language"),
+            "javascript": ("tree_sitter_javascript", "language")}
 
 EXTENSIONS = {
     ".py": "python",
@@ -45,10 +46,12 @@ EXTENSIONS = {
     ".bat": "batch",
 }
 
+NAMES: dict[str, str] = {}  # file names with a language but no telling extension (Rakefile)
+
 JS_FUNCTION_VALUES = {"arrow_function", "function_expression", "function", "generator_function"}
 
-# (name, kind, node whose lines form the chunk)
-Found = tuple[str, str, Node]
+# (name, kind, node whose lines form the chunk, whether its language counts it as public)
+Found = tuple[str, str, Node, bool]
 
 
 @dataclass(frozen=True)
@@ -59,6 +62,7 @@ class Chunk:
     end_line: int
     source: str
     doc: str | None = None  # the first paragraph of its documentation, cleaned (see _clean)
+    exported: bool | None = None  # public in its language (research R9); None for a line window
 
 
 class Call(NamedTuple):
@@ -76,26 +80,33 @@ class Import(NamedTuple):
 
 
 def detect_language(path: str) -> str:
-    return EXTENSIONS.get(PurePath(path).suffix.lower(), "text")
+    path = PurePath(path)
+    return NAMES.get(path.name) or EXTENSIONS.get(path.suffix.lower(), "text")
 
 
 @cache
 def _parser(language: str) -> Parser:
-    return Parser(Language(GRAMMARS[language].language()))
+    module, function = GRAMMARS[language]
+    return Parser(Language(getattr(importlib.import_module(module), function)()))
 
 
 def _name(node: Node) -> str:
     return node.child_by_field_name("name").text.decode()
 
 
+def _public(name: str) -> bool:
+    """Python's and JavaScript's rule: a leading underscore marks a name private."""
+    return not name.startswith("_")
+
+
 def _python(body: Node, prefix: str = "") -> Iterator[Found]:
     for outer in body.named_children:
         node = outer.child_by_field_name("definition") if outer.type == "decorated_definition" else outer
         if node.type == "function_definition":
-            yield prefix + _name(node), "method" if prefix else "function", outer
+            yield prefix + _name(node), "method" if prefix else "function", outer, _public(_name(node))
         elif node.type == "class_definition":
             name = prefix + _name(node)
-            yield name, "class", outer
+            yield name, "class", outer, _public(_name(node))
             yield from _python(node.child_by_field_name("body"), name + ".")
 
 
@@ -104,18 +115,22 @@ def _go_receiver(node: Node) -> str:
     return receiver.text.decode().lstrip("*").split("[")[0].strip()
 
 
+def _go_public(name: str) -> bool:
+    return name[:1].isupper()
+
+
 def _go(root: Node) -> Iterator[Found]:
     for node in root.named_children:
         if node.type == "function_declaration":
-            yield _name(node), "function", node
+            yield _name(node), "function", node, _go_public(_name(node))
         elif node.type == "method_declaration":
-            yield f"{_go_receiver(node)}.{_name(node)}", "method", node
+            yield f"{_go_receiver(node)}.{_name(node)}", "method", node, _go_public(_name(node))
         elif node.type == "type_declaration":
             grouped = any(child.type == "(" for child in node.children)
             for spec in node.named_children:
                 if spec.type in ("type_spec", "type_alias"):
                     kind = "interface" if spec.child_by_field_name("type").type == "interface_type" else "type"
-                    yield _name(spec), kind, spec if grouped else node
+                    yield _name(spec), kind, spec if grouped else node, _go_public(_name(spec))
 
 
 def _javascript(root: Node) -> Iterator[Found]:
@@ -128,25 +143,26 @@ def _javascript(root: Node) -> Iterator[Found]:
             if node is None:
                 continue
         if node.type in ("function_declaration", "generator_function_declaration"):
-            yield _name(node), "function", outer
+            yield _name(node), "function", outer, _public(_name(node))
         elif node.type == "class_declaration":
             name = _name(node)
-            yield name, "class", outer
+            yield name, "class", outer, _public(name)
             for method in node.child_by_field_name("body").named_children:
                 if method.type == "method_definition":
-                    yield f"{name}.{_name(method)}", "method", method
+                    yield f"{name}.{_name(method)}", "method", method, _public(_name(method))
         elif node.type in ("lexical_declaration", "variable_declaration"):
             for declarator in node.named_children:
                 value = declarator.child_by_field_name("value")
                 if declarator.type == "variable_declarator" and value and value.type in JS_FUNCTION_VALUES:
-                    yield _name(declarator), "function", outer
+                    yield _name(declarator), "function", outer, _public(_name(declarator))
 
 
-WALKERS = {"python": _python, "go": _go, "javascript": _javascript}
+WALKERS: dict[str, Callable[[Node], Iterator[Found]]] = {"python": _python, "go": _go, "javascript": _javascript}
 
 
 # The call node types with their callee field, and the attribute node type with its (receiver, name) fields.
-CALLS = {
+# A language in languages.py gives a function (root, scopes) -> list[Call] instead.
+CALLS: dict = {
     "python": ({"call": "function"}, "attribute", ("object", "attribute")),
     "go": ({"call_expression": "function"}, "selector_expression", ("operand", "field")),
     "javascript": (
@@ -317,33 +333,47 @@ SYMBOL_DOCS = {
 }
 
 
-def _file_doc(language: str, root: Node, data: bytes) -> str | None:
-    if language == "python":
-        return _docstring(root)
-    if language == "go":
-        package = next((c for c in root.named_children if c.type == "package_clause"), None)
-        return _go_doc(package, data) if package else None
-    return None  # simplified: no JS file docs, read a leading block comment when a JS repository needs it
+def _go_file_doc(root: Node, data: bytes) -> str | None:
+    package = next((c for c in root.named_children if c.type == "package_clause"), None)
+    return _go_doc(package, data) if package else None
 
 
-def parse(language: str, text: str) -> tuple[list[Chunk], list[Call], list[Import], str | None] | None:
-    """Definition chunks, calls, imports and the file's doc, or None when there is no grammar or the file does not
-    parse cleanly."""
+# simplified: no JS file docs, read a leading block comment when a JS repository needs it
+FILE_DOCS: dict = {"python": lambda root, data: _docstring(root), "go": _go_file_doc}
+NAMESPACES: dict = {}  # language -> root -> the namespaces the file declares (C#)
+LEADING: dict[str, set[str]] = {}  # language -> sibling node types above a definition that belong to its chunk
+
+
+def _start(language: str, node: Node) -> Node:
+    """The first of the attribute-like siblings directly above the node, or the node itself."""
+    first, kinds = node, LEADING.get(language, ())
+    while (prev := first.prev_named_sibling) is not None and prev.type in kinds:
+        first = prev
+    return first
+
+
+def parse(language: str, text: str) -> tuple[list[Chunk], list[Call], list[Import], str | None, list[str]] | None:
+    """Definition chunks, calls, imports, the file's doc and its declared namespaces, or None when there is no
+    grammar or the file does not parse cleanly."""
     if language not in GRAMMARS:
         return None
     data = text.encode("utf-8")
-    root = _parser(language).parse(data).root_node
+    # a directive on the last line needs its line end (C#'s #pragma, C's #endif); the lines are unchanged by it
+    root = _parser(language).parse(data if data.endswith(b"\n") else data + b"\n").root_node
     if root.has_error:
         return None
     lines = text.splitlines()
     chunks, scopes = [], {}
-    for name, kind, node in WALKERS[language](root):
-        start, end = node.start_point.row + 1, node.end_point.row + 1
+    for name, kind, node, exported in WALKERS[language](root):
+        start, end = _start(language, node).start_point.row + 1, node.end_point.row + 1
         doc = _clean(SYMBOL_DOCS[language](node, data))
-        chunks.append(Chunk(name, kind, start, end, "\n".join(lines[start - 1 : end]), doc))
+        chunks.append(Chunk(name, kind, start, end, "\n".join(lines[start - 1 : end]), doc, exported))
         scopes[_definition(node).id] = name
-    file_doc = _clean(_file_doc(language, root, data))
-    return chunks, _calls(language, root, scopes), list(IMPORTS[language](root)), file_doc
+    file_doc = FILE_DOCS.get(language)
+    calls = CALLS[language](root, scopes) if callable(CALLS[language]) else _calls(language, root, scopes)
+    namespaces = NAMESPACES.get(language)
+    return (chunks, calls, list(IMPORTS[language](root)), _clean(file_doc(root, data)) if file_doc else None,
+            namespaces(root) if namespaces else [])
 
 
 def chunk(language: str, text: str) -> list[Chunk] | None:
@@ -362,3 +392,13 @@ def windows(name: str, text: str, size: int = 60, step: int = 50) -> list[Chunk]
         if end == len(lines):
             break
     return chunks
+
+
+# The other languages' rules (specs/012-language-coverage). Imported last: languages.py uses the helpers above.
+from golestan_code_mcp import languages as _languages  # noqa: E402
+
+for _table, _theirs in [(EXTENSIONS, _languages.EXTENSIONS), (NAMES, _languages.NAMES), (GRAMMARS, _languages.GRAMMARS),
+                        (WALKERS, _languages.WALKERS), (CALLS, _languages.CALLS), (IMPORTS, _languages.IMPORTS),
+                        (SYMBOL_DOCS, _languages.SYMBOL_DOCS), (FILE_DOCS, _languages.FILE_DOCS),
+                        (NAMESPACES, _languages.NAMESPACES), (LEADING, _languages.LEADING)]:
+    _table.update(_theirs)

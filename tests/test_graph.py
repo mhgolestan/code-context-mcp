@@ -501,3 +501,201 @@ def test_external_imports_of_the_graph_repositories(conn, repos):
             rid = registry.repo_id(conn, name)
             paths = dict(cur.execute("select id, path from ccctx_files where repo_id = :r", r=rid).fetchall())
             assert {paths[f]: n for f, n in graph.external_imports(cur, rid).items() if n} == expected
+
+
+# --- language coverage (012): resolution helpers ---
+
+
+def test_suffix_index_maps_every_path_suffix():
+    index = graph._suffix_index({"src/com/acme/Order.java": 1, "lib/Order.java": 2, "a.h": 3})
+    assert index["src/com/acme/Order.java"] == [1] and index["com/acme/Order.java"] == [1]
+    assert sorted(index["Order.java"]) == [1, 2] and index["a.h"] == [3]
+    assert "src" not in index and "com/acme" not in index  # files only, never folders
+
+
+@pytest.mark.parametrize(("receiver", "normalized"), [
+    ("$this", "this"), ("Foo::bar", "Foo.bar"), ("self->engine", "self.engine"), ("a.b", "a.b"), (None, None),
+    ("$repo->db", "repo.db"),
+])
+def test_receivers_are_normalized_to_dotted_names(receiver, normalized):
+    assert graph._normalize(receiver) == normalized
+
+
+def test_self_receivers_include_the_new_languages():
+    assert {"self", "cls", "this", "Self", "base"} <= graph.SELF
+
+
+def test_files_carry_their_namespaces(conn, repos):
+    with conn.cursor() as cur:
+        files = graph._files(cur, {"r": registry.repo_id(conn, repos[0])})
+    assert files and all(len(v) == 3 and v[2] is None for v in files.values())
+
+
+# --- the new languages through ingest and the graph (012), on tests/fixtures/languages/<language>/ ---
+
+import shutil  # noqa: E402
+from pathlib import Path  # noqa: E402
+
+LANGUAGE_FIXTURES = Path(__file__).parent / "fixtures" / "languages"
+
+
+def language_repo(conn, root, *languages):
+    """A `t-` repository of the named languages' fixture files, ingested. Returns (name, summary)."""
+    root.mkdir(parents=True)
+    for language in languages:
+        shutil.copytree(LANGUAGE_FIXTURES / language, root / language)
+    make(root, {})
+    name = f"t-{uuid.uuid4().hex[:8]}"
+    registry.add_repo(conn, root, name)
+    return name, ingest.ingest(conn, name, ENV)
+
+
+def file_imports(conn, name):
+    """(importer, imported) paths of the repository's import edges."""
+    with conn.cursor() as cur:
+        cur.execute("""select f.path, t.path from ccctx_imports i join ccctx_files f on f.id = i.importer_id
+                         join ccctx_files t on t.id = i.imported_id join ccctx_repos r on r.id = f.repo_id
+                        where r.name = :n""", n=name)
+        return set(cur.fetchall())
+
+
+def outside(conn, name):
+    """path -> the outside packages it imports."""
+    with conn.cursor() as cur:
+        rid = registry.repo_id(conn, name)
+        paths = dict(cur.execute("select id, path from ccctx_files where repo_id = :r", r=rid).fetchall())
+        return {paths[fid]: names for fid, names in graph.external_imports(cur, rid).items()}
+
+
+@pytest.fixture(scope="module")
+def csharp(conn, tmp_path_factory):
+    return language_repo(conn, tmp_path_factory.mktemp("cs") / "repo", "csharp")
+
+
+def test_csharp_ingests_as_definitions(csharp):
+    _, summary = csharp
+    assert (summary.no_grammar, summary.parse_errors) == (0, 1)  # only Broken.cs falls back
+
+
+def test_csharp_callers_across_projects(conn, csharp):
+    name, _ = csharp
+    found = {(c.name, c.path, c.line, c.callee) for c in graph.callers(conn, "Start", [name])}
+    assert found == {("ProductSteps.OpenProduct", "csharp/App/Steps/ProductSteps.cs", 17, "DriverFixture.Start"),
+                     ("DriverFixture.Log", "csharp/App/Driver/DriverFixture.Logging.cs", 8, "DriverFixture.Start")}
+    assert {(c.name, c.path) for c in graph.calls(conn, "DriverFixture.Start", [name])} >= {
+        ("DriverFixture.GetWebDriver", "csharp/App/Driver/DriverFixture.cs"),
+        ("BrowserDriver.Open", "csharp/App/Driver/BrowserDriver.cs")}
+
+
+def test_csharp_usings_resolve_through_declared_namespaces(conn, csharp):
+    name, _ = csharp
+    driver = {f"csharp/App/Driver/{f}" for f in ("DriverFixture.cs", "DriverFixture.Logging.cs", "BrowserDriver.cs")}
+    assert file_imports(conn, name) == {("csharp/App/Steps/ProductSteps.cs", f) for f in driver}
+    assert outside(conn, name) == {"csharp/App/Driver/DriverFixture.cs": {"System"},
+                                   "csharp/App/Steps/ProductSteps.cs": {"System.Linq"}}
+
+
+@pytest.fixture(scope="module")
+def us2(conn, tmp_path_factory):
+    return language_repo(conn, tmp_path_factory.mktemp("us2") / "repo", "typescript", "tsx", "c", "cpp")
+
+
+def test_us2_ingests_as_definitions(us2):
+    _, summary = us2
+    assert (summary.no_grammar, summary.parse_errors) == (0, 4)  # only the four broken files fall back
+
+
+def test_us2_callers(conn, us2):
+    name, _ = us2
+    assert {(c.name, c.path, c.line) for c in graph.callers(conn, "parse_config", [name])} == {
+        ("load", "c/parse.c", 14), ("reload", "c/parse.c", 19)}  # not from the comment
+    assert {(c.name, c.path, c.line) for c in graph.callers(conn, "Engine.start", [name])} == {
+        ("main", "cpp/engine.cpp", 19)}
+    assert {c.name for c in graph.calls(conn, "Engine.start", [name])} == {"Engine.warm", "Engine.speed"}
+    assert {(c.name, c.path) for c in graph.callers(conn, "count", [name])} == {
+        ("Cart.area", "typescript/src/cart.ts")}  # api.count() through `import * as api from "./api"`
+
+
+def test_us2_imports_resolve(conn, us2):
+    name, _ = us2
+    assert file_imports(conn, name) == {
+        ("typescript/src/cart.ts", "typescript/src/api/client.ts"),
+        ("typescript/src/cart.ts", "typescript/src/api/index.ts"),
+        ("typescript/src/cart.ts", "typescript/src/types.ts"),
+        ("tsx/App.tsx", "tsx/format.ts"),
+        ("c/parse.c", "c/config.h"),
+        ("cpp/engine.cpp", "cpp/engine.h"),
+    }
+    assert outside(conn, name) == {"c/parse.c": {"stdio.h"}, "cpp/engine.h": {"vector"}}
+
+
+def test_an_include_found_by_path_anywhere_in_the_repository(conn, tmp_path):
+    root = tmp_path / "repo"
+    make(root, {"include/util/str.h": "int len(const char *s);\n",
+                "src/main.c": '#include "util/str.h"\n\nint main(void) {\n    return len("x");\n}\n'})
+    name = f"t-{uuid.uuid4().hex[:8]}"
+    registry.add_repo(conn, root, name)
+    ingest.ingest(conn, name, ENV)
+    assert file_imports(conn, name) == {("src/main.c", "include/util/str.h")}
+
+
+@pytest.fixture(scope="module")
+def us4(conn, tmp_path_factory):
+    return language_repo(conn, tmp_path_factory.mktemp("us4") / "repo", "java", "kotlin", "rust")
+
+
+def test_us4_ingests_as_definitions(us4):
+    _, summary = us4
+    assert (summary.no_grammar, summary.parse_errors) == (0, 3)  # Broken.java, OneLine.kt, broken.rs
+
+
+def test_us4_callers(conn, us4):
+    name, _ = us4
+    java = "java/src/main/java/com/acme/"
+    assert {(c.name, c.path, c.line) for c in graph.callers(conn, "add", [name])} == {
+        ("Order.total", java + "Order.java", 21)}
+    assert {c.name for c in graph.calls(conn, "Order.total", [name]) if c.path.endswith(".java")} == {
+        "Money", "Money.add", "Order.sum"}  # sum() is this.sum()
+    assert {(c.name, c.line) for c in graph.callers(conn, "Order.create", [name])} == {("Registry.all", 32)}
+    assert {(c.name, c.path) for c in graph.callers(conn, "Circle.new", [name])} == {("make", "rust/src/lib.rs")}
+    assert {c.name for c in graph.callers(conn, "square", [name])} == {"Circle.area"}
+
+
+def test_us4_imports_resolve(conn, us4):
+    name, _ = us4
+    java = "java/src/main/java/com/acme/"
+    assert file_imports(conn, name) == {
+        (java + "Order.java", java + "util/Money.java"),  # the class import and the wildcard
+        ("kotlin/com/acme/Order.kt", "kotlin/com/acme/Money.kt"),
+        ("rust/src/lib.rs", "rust/src/geometry.rs"),  # mod geometry; and use crate::geometry::Circle
+    }
+    assert outside(conn, name) == {java + "Order.java": {"java.util"}, "rust/src/lib.rs": {"std"}}
+
+
+@pytest.fixture(scope="module")
+def us5(conn, tmp_path_factory):
+    return language_repo(conn, tmp_path_factory.mktemp("us5") / "repo", "php", "ruby", "swift")
+
+
+def test_us5_ingests_as_definitions(us5):
+    _, summary = us5
+    assert (summary.no_grammar, summary.parse_errors) == (0, 3)  # broken.php, broken.rb, Broken.swift
+
+
+def test_us5_callers(conn, us5):
+    name, _ = us5
+    assert {(c.name, c.path) for c in graph.callers(conn, "Logger.write", [name])} == {("Repo.log", "php/Repo.php")}
+    assert {(c.name, c.path) for c in graph.callers(conn, "query", [name])} == {("Repo.find", "php/Repo.php")}
+    assert {c.name for c in graph.callers(conn, "Acme.Parser.lex", [name])} == {"Acme.Parser.parse"}  # implicit self
+    assert {c.name for c in graph.callers(conn, "Circle.area", [name])} == {"Engine.start"}
+    assert {c.name for c in graph.callers(conn, "square", [name])} == {"Circle.area"}
+
+
+def test_us5_imports_resolve(conn, us5):
+    name, _ = us5
+    assert file_imports(conn, name) == {
+        ("php/Repo.php", "php/lib/db.php"),  # require_once __DIR__ . '/lib/db.php'
+        ("php/Repo.php", "php/App/Util/Logger.php"),  # use App\Util\Logger; by PSR-4
+        ("ruby/lib/parser.rb", "ruby/lib/lexer.rb"),  # require_relative "lexer"
+    }  # Swift files import no files
+    assert outside(conn, name) == {"ruby/lib/parser.rb": {"json"}, "swift/Shapes.swift": {"Foundation"}}

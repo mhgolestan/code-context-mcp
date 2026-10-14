@@ -31,6 +31,7 @@ CONTRACT = SPECS / "008-mcp-tools" / "contracts" / "tools.md"
 WIKI_CONTRACT = SPECS / "009-module-wiki" / "contracts" / "tools.md"
 MEMORY_CONTRACT = SPECS / "010-agent-memory" / "contracts" / "tools.md"
 FEEDBACK_CONTRACT = SPECS / "011-usage-feedback" / "contracts" / "tools.md"
+LANGUAGE_CONTRACT = SPECS / "012-language-coverage" / "contracts" / "tools.md"
 TOOLS = ["search_code", "get_symbol", "find_callers", "find_callees", "impact_of", "read_wiki", "list_repositories",
          "recall", "mark_used"]
 FACT_SENTENCE = ("A hit of kind fact is something an earlier session worked out about the code at its path; recall "
@@ -95,6 +96,8 @@ def contract():
             cells = [c.strip() for c in line.split("|")]
             if len(cells) == 5 and cells[1].startswith("`"):
                 params[(tool, cells[1].strip("`"))] = cells[3]
+    languages = LANGUAGE_CONTRACT.read_text(encoding="utf-8").split("| Parameter | Description |", 1)[1]
+    params[("search_code", "language")] = re.search(r"^\| `language` \| (.+) \|$", languages, re.M).group(1)
     return tools, params
 
 
@@ -802,3 +805,39 @@ def test_search_with_feedback_off_matches_the_core(fresh_session):
     with db.connect(load()) as conn:
         expected = [vars(r) for r in semantic.search(conn, "post entry", [fresh_session], feedback=False)]
     assert call("search_code", query="post entry", repo=fresh_session, feedback=False)["results"] == expected
+
+
+# --- language coverage (specs/012-language-coverage contracts/tools.md) ------------------------------------------
+
+
+def test_an_unknown_language_lists_the_new_ones(monkeypatch):
+    monkeypatch.setenv("DB_PORT", "1")
+    reason = call("search_code", query="x", language="cobol")["reason"]
+    assert reason == f"unknown language 'cobol'; valid languages: {', '.join(semantic.LANGUAGES)}"
+    assert {"csharp", "typescript", "tsx", "c", "cpp", "java", "kotlin", "rust", "php", "ruby", "swift"} <= set(
+        reason.split(": ", 1)[1].split(", "))
+
+
+def test_search_code_finds_csharp_definitions_as_the_core_does(tmp_path):
+    import shutil
+
+    conn = ready()
+    with conn:
+        root = tmp_path / "repo"
+        shutil.copytree(Path(__file__).parent / "fixtures" / "languages" / "csharp", root)
+        for args in (["init", "-q"], ["add", "-A"], ["commit", "-q", "-m", "init"]):
+            subprocess.run(["git", "-c", "user.email=t@t", "-c", "user.name=t", *args], cwd=root, check=True,
+                           capture_output=True)
+        name = f"t-{uuid.uuid4().hex[:8]}"
+        registry.add_repo(conn, str(root), name)
+        try:
+            ingest.ingest(conn, name)
+            expected = [vars(r) for r in semantic.search(conn, "start the browser", [name], language="csharp")]
+            result = call("search_code", query="start the browser", repo=name, language="csharp")
+            assert result == {"status": "ok", "reason": None, "results": expected}
+            assert expected and {h["language"] for h in expected} == {"csharp"}
+            assert "DriverFixture.Start" in {h["name"] for h in expected}
+        finally:
+            with conn.cursor() as cur:
+                cur.execute("delete from ccctx_repos where name = :n", n=name)
+            conn.commit()

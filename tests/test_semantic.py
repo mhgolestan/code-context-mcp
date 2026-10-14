@@ -7,6 +7,7 @@ teardown removes only this run's repositories, so parallel test runs keep theirs
 """
 
 import re
+from pathlib import Path
 import uuid
 
 import pytest
@@ -17,7 +18,10 @@ from golestan_code_mcp.config import load
 RUN = uuid.uuid4().hex[:6]
 A, B, C = f"t-{RUN}a", f"t-{RUN}b", f"t-{RUN}c"
 TOKEN = f"quokka_{RUN}"  # appears in every symbol of C and nowhere else
-LANGUAGE_LIST = "batch, css, go, html, ini, javascript, json, markdown, proto, python, rst, shell, sql, text, toml, yaml"
+# the list in specs/012-language-coverage/contracts/tools.md, which extends 008's with the new languages
+LANGUAGE_LIST = re.search(r"Search only files of this language: one of (.+?)\. Default",
+                          (Path(__file__).resolve().parents[1] / "specs" / "012-language-coverage" / "contracts"
+                           / "tools.md").read_text(encoding="utf-8")).group(1)
 
 SYMBOLS = {
     A: [

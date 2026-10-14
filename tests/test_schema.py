@@ -494,5 +494,40 @@ def test_uses_go_with_their_repository_and_outlive_their_run(conn, repo_id):
     conn.rollback()
 
 
-def test_schema_version_is_nine(conn):
-    assert schema.version(conn) == 9
+# --- language coverage (specs/012-language-coverage/data-model.md) ---
+
+
+def test_language_coverage_columns(conn):
+    with conn.cursor() as cur:
+        assert cur.execute("select name from ccctx_migrations where version = 10").fetchone() == ("language coverage",)
+        assert columns_of(cur, "CCCTX_FILES")["NAMESPACES"][:2] == ("JSON", "Y")
+        assert columns_of(cur, "CCCTX_SYMBOLS")["EXPORTED"][:2] == ("BOOLEAN", "Y")
+
+
+def test_exported_backfill_follows_the_name_rule(conn, repo_id):
+    with conn.cursor() as cur:
+        go = insert(cur, "insert into ccctx_files (repo_id, path, language, content_hash) values (:r, 'a.go', 'go', :h)",
+                    r=repo_id, h="0" * 64)
+        py = add_file(cur, repo_id, "b.py")
+        rows = {}
+        for fid, name, kind in [(go, "Serve", "function"), (go, "Server.close", "method"), (py, "Flask._private",
+                                "method"), (py, "url_for", "function"), (py, "b.py:1-60", "chunk")]:
+            rows[name] = insert(cur, "insert into ccctx_symbols (file_id, name, kind, start_line, end_line, source,"
+                                     " content_hash, commit_sha) values (:f, :n, :k, 1, 2, 'x', :h, :c)",
+                                f=fid, n=name, k=kind, h="0" * 64, c=SHA)
+        update = next(s for v, n, steps in schema.MIGRATIONS if v == 10 for s in steps
+                      if isinstance(s, str) and s.lstrip().startswith("update"))
+        cur.execute(update)
+        got = {n: cur.execute("select exported from ccctx_symbols where id = :i", i=i).fetchone()[0]
+               for n, i in rows.items()}
+        assert got == {"Serve": True, "Server.close": False, "Flask._private": False, "url_for": True,
+                       "b.py:1-60": None}
+        cur.execute("update ccctx_symbols set exported = true where id = :i", i=rows["Flask._private"])
+        cur.execute(update)  # only null rows are touched
+        assert cur.execute("select exported from ccctx_symbols where id = :i",
+                           i=rows["Flask._private"]).fetchone()[0] is True
+    conn.rollback()
+
+
+def test_schema_version_is_ten(conn):
+    assert schema.version(conn) == 10

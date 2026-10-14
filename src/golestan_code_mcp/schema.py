@@ -233,6 +233,18 @@ MIGRATIONS: list[tuple[int, str, list[str]]] = [
           constraint ccctx_feedback_how_ck check (how in ('cited', 'opened')))""",
         "create index ccctx_feedback_result_ix on ccctx_feedback (repo_id, name)",
     ]),
+    # The namespaces a C# file declares, which its `using`s resolve through, and each definition's visibility,
+    # which the wiki ranks by (012). Rows written before get today's name rule.
+    (10, "language coverage", [
+        "alter table ccctx_files add (namespaces json)",
+        "alter table ccctx_symbols add (exported boolean)",
+        """update ccctx_symbols s
+              set exported = case
+                    when (select f.language from ccctx_files f where f.id = s.file_id) = 'go'
+                      then regexp_like(regexp_substr(s.name, '[^.]+$'), '^[A-Z]')
+                    else not regexp_like(regexp_substr(s.name, '[^.]+$'), '^_') end
+            where s.kind <> 'chunk' and s.exported is null""",
+    ]),
 ]
 
 

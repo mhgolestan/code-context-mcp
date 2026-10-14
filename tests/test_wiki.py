@@ -477,3 +477,100 @@ def test_read_refuses_unknown_and_ambiguous_pages(conn, built, tmp_path):
         wiki.read(conn, unique)
     assert str(e.value) == f"wiki page '{unique}' is in more than one repository: {names[0]}, {names[1]}; pass --repo"
     assert wiki.read(conn, unique, names[1]).repo == names[1]
+
+
+# --- language coverage (012): key symbols rank by the stored visibility ---
+
+
+def test_key_symbols_rank_by_the_stored_exported_flag(conn, fresh):
+    name, _ = fresh
+    keys = re.findall(r"^- `([^`]+)` \(", text(conn, name, name), re.M)
+    assert keys[0] == "r0"  # ties (no callers, no docs) fall to the name
+    with conn.cursor() as cur:
+        cur.execute("""update ccctx_symbols set exported = false where name = 'r0' and file_id in
+                         (select id from ccctx_files where repo_id = :r and path = 'root.py')""", r=rid(conn, name))
+    conn.commit()
+    wiki.build(conn, name)
+    assert re.findall(r"^- `([^`]+)` \(", text(conn, name, name), re.M)[-1] == "r0"
+
+
+# --- the new languages' pages (012), on tests/fixtures/languages/<language>/ ---
+
+import shutil  # noqa: E402
+from pathlib import Path  # noqa: E402
+
+LANGUAGE_FIXTURES = Path(__file__).parent / "fixtures" / "languages"
+
+
+def language_wiki(conn, root, *languages):
+    """A `t-` repository of the named languages' fixture files, ingested and with its wiki built. Returns its name."""
+    root.mkdir(parents=True)
+    for language in languages:
+        shutil.copytree(LANGUAGE_FIXTURES / language, root / language)
+    git(root, "init", "-q")
+    commit(root, "init")
+    name = f"t-{uuid.uuid4().hex[:8]}"
+    registry.add_repo(conn, root, name)
+    ingest.ingest(conn, name, ENV)
+    wiki.build(conn, name)
+    return name
+
+
+def page_of(conn, name, directory):
+    return next(row for row in page_rows(conn, name).values() if row[0] == directory)
+
+
+def test_a_csharp_directory_page(conn, tmp_path):
+    name = language_wiki(conn, tmp_path / "repo", "csharp")
+    _, page, language, symbols, body, *_ = page_of(conn, name, "csharp/App/Driver")
+    assert language == "csharp" and symbols == 16
+    assert f"`{page}` is a C# directory of 3 files and 16 definitions" in body
+    keys = re.findall(r"^- `([^`]+)` \(", body, re.M)
+    assert {"DriverFixture", "BrowserDriver"} <= set(keys[:4])
+    assert "## Used by\n- `csharp/App/Steps`\n" in body  # its `using App.Driver;`, through declared namespaces
+    assert "DriverFixture.Start" in keys and "DriverFixture.GetWebDriver" not in keys  # called from outside; private
+    assert "csharp/App/Steps" not in {row[0] for row in page_rows(conn, name).values()}  # 4 definitions, no page
+
+
+def test_a_typescript_directory_page(conn, tmp_path):
+    name = language_wiki(conn, tmp_path / "repo", "typescript", "cpp")
+    _, page, language, _, body, *_ = page_of(conn, name, "typescript/src")
+    assert language == "typescript" and f"`{page}` is a TypeScript directory" in body
+    assert "Cart.#secret" not in re.findall(r"^- `([^`]+)` \(", body, re.M)[:5]
+
+
+@pytest.mark.parametrize(("path", "test"), [
+    ("src/cart.test.ts", True), ("src/cart.spec.tsx", True), ("src/cart.ts", False), ("test/test_parse.c", True),
+    ("src/parse_test.cpp", True), ("src/parse.cpp", False),
+])
+def test_us2_test_files_rank_last(path, test):
+    assert wiki._is_test(path) is test
+
+
+def test_a_kotlin_directory_page(conn, tmp_path):
+    name = language_wiki(conn, tmp_path / "repo", "kotlin")
+    _, page, language, _, body, *_ = page_of(conn, name, "kotlin/com/acme")
+    assert language == "kotlin" and f"`{page}` is a Kotlin directory" in body
+
+
+@pytest.mark.parametrize(("path", "test"), [
+    ("src/OrderTest.java", True), ("src/OrderTests.kt", True), ("src/Order.java", False), ("tests/geometry.rs", True),
+    ("src/geometry.rs", False),
+])
+def test_us4_test_files_rank_last(path, test):
+    assert wiki._is_test(path) is test
+
+
+def test_every_language_with_rules_has_a_plain_name():
+    from golestan_code_mcp.chunker import GRAMMARS
+
+    assert set(wiki.LANGUAGE_NAMES) == set(GRAMMARS)
+    assert {wiki.LANGUAGE_NAMES[k] for k in ("php", "ruby", "swift")} == {"PHP", "Ruby", "Swift"}
+
+
+@pytest.mark.parametrize(("path", "test"), [
+    ("tests/RepoTest.php", True), ("lib/parser_test.rb", True), ("spec/parser_spec.rb", True),
+    ("ShapesTests.swift", True), ("lib/parser.rb", False), ("Repo.php", False),
+])
+def test_us5_test_files_rank_last(path, test):
+    assert wiki._is_test(path) is test

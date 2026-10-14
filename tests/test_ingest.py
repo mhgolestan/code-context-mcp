@@ -727,3 +727,96 @@ def test_failed_recompile_keeps_the_ingestion(conn, wiki_repo, monkeypatch):
     assert "compiler broke" in s.wiki.error
     assert revision(conn, name) == (head(wiki_repo), False)  # the ingestion is committed
     assert pages_of(conn, name)["pkg"][0] == "stale"
+
+
+# --- language coverage (012): exported and namespaces are stored ---
+
+
+def visibility(conn, name):
+    with conn.cursor() as cur:
+        cur.execute("""select f.path, f.language, f.namespaces, s.name, s.kind, s.exported
+                         from ccctx_files f join ccctx_repos r on r.id = f.repo_id
+                         left join ccctx_symbols s on s.file_id = f.id where r.name = :n""", n=name)
+        return sorted(cur.fetchall(), key=repr)
+
+
+def test_exported_and_namespaces_are_stored_and_stable(conn, repo):
+    name = register(conn, repo)
+    ingest.ingest(conn, name, ENV)
+    rows = visibility(conn, name)
+    assert {namespaces for _, _, namespaces, *_ in rows} == {None}
+    for path, language, _, symbol, kind, exported in rows:
+        if kind == "chunk" or symbol is None:
+            assert exported is None, (path, symbol)
+        else:
+            last = symbol.rpartition(".")[2]
+            assert exported == (last[:1].isupper() if language == "go" else not last.startswith("_")), symbol
+    assert any(exported is True for *_, exported in rows)
+    ingest.ingest(conn, name, ENV, full=True)
+    assert visibility(conn, name) == rows
+
+
+# --- language coverage (012, US3): files whose language gained rules are re-read ---
+
+
+from golestan_code_mcp import chunker, feedback, memory  # noqa: E402
+
+CS = "namespace Shop;\n\npublic class Cart\n{\n    public int Total()\n    {\n        return 1;\n    }\n}\n"
+
+
+@pytest.fixture
+def before_csharp(conn, tmp_path, monkeypatch):
+    """(name, root) of a repository ingested while `.cs` had no rules: its Cart.cs is stored as `text` windows."""
+    root = tmp_path / "repo"
+    root.mkdir()
+    git(root, "init", "-q")
+    for rel, text in {"app.py": APP_PY, "shop/Cart.cs": CS}.items():
+        (root / rel).parent.mkdir(parents=True, exist_ok=True)
+        (root / rel).write_text(text, encoding="utf-8", newline="\n")
+    git(root, "add", "-A")
+    git(root, "commit", "-q", "-m", "init")
+    name = register(conn, root)
+    with monkeypatch.context() as m:
+        m.delitem(chunker.EXTENSIONS, ".cs")
+        assert ingest.ingest(conn, name, ENV).no_grammar == 1
+    assert {(r[1], r[4]) for r in stored(conn, name) if r[0] == "shop/Cart.cs"} == {("text", "chunk")}
+    return name, root
+
+
+def test_files_whose_language_gained_rules_are_re_read(conn, before_csharp, caplog):
+    name, _ = before_csharp
+    python_ids = symbol_ids(conn, name, "app.py")
+    with caplog.at_level(logging.INFO, logger="golestan_code_mcp.ingest"):
+        summary = ingest.ingest(conn, name, ENV)
+    assert summary.mode == "incremental" and summary.reparsed == Counter(csharp=1)
+    assert (summary.changed, summary.added, summary.removed, summary.files) == (1, 0, 0, 1)
+    assert {(r[1], r[3], r[4]) for r in stored(conn, name) if r[0] == "shop/Cart.cs"} == {
+        ("csharp", "Cart", "class"), ("csharp", "Cart.Total", "method")}
+    assert symbol_ids(conn, name, "app.py") == python_ids  # unchanged files of other languages are not read
+    record = next(json.loads(r.getMessage()) for r in caplog.records if '"event": "ingest"' in r.getMessage())
+    assert record["reparsed"] == {"csharp": 1}
+    assert ingest.ingest(conn, name, ENV).mode == "current"
+    assert ingest.ingest(conn, name, ENV, full=True).reparsed == Counter()
+
+
+def test_uses_and_facts_of_the_old_windows_end_like_removed_code(conn, before_csharp):
+    name, _ = before_csharp
+    window = next(r[3] for r in stored(conn, name) if r[0] == "shop/Cart.cs")
+    with conn.cursor() as cur:
+        feedback.write_use(cur, {"repo_id": registry.repo_id(conn, name), "path": "shop/Cart.cs", "name": window,
+                                 "kind": "chunk", "how": "cited", "client": "t", "session": uuid.uuid4().hex,
+                                 "run_id": None})
+    conn.commit()
+    run = {"tool": "search_code", "arguments": {"query": "cart total", "repo": name}, "question": "cart total",
+           "client": None, "status": "ok", "reason": None, "ms": 1, "result_count": 1, "repos": [name],
+           "results": [{"kind": "chunk", "repo": name, "name": window, "path": "shop/Cart.cs", "start_line": 1,
+                        "end_line": 10}]}
+    memory.store_runs(conn, [run])
+    try:
+        memory.consolidate(conn, name, ENV)
+        assert [(f.subject, f.state) for f in memory.facts(conn, name)] == [(window, "fresh")]
+        ingest.ingest(conn, name, ENV)  # the window is gone: the file is definitions now
+        assert [(f.subject, f.state) for f in memory.facts(conn, name)] == [(window, "stale")]
+        assert [(r.name, r.indexed) for r in feedback.listing(conn, name)] == [(window, False)]
+    finally:
+        memory.client(conn).delete_user(name, cascade=True)

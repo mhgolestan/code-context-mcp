@@ -148,7 +148,7 @@ class Box:
 
 
 def refs(language: str, text: str) -> tuple[set[tuple], set[tuple]]:
-    _, calls, imports, _ = parse(language, text)
+    _, calls, imports, _, _ = parse(language, text)
     return {tuple(c) for c in calls}, {tuple(i) for i in imports}
 
 
@@ -230,7 +230,7 @@ def test_syntax_error_yields_no_calls_or_imports():
 
 
 def docs(language: str, text: str) -> tuple[dict[str, str | None], str | None]:
-    chunks, _, _, file_doc = parse(language, text)
+    chunks, _, _, file_doc, _ = parse(language, text)
     return {c.name: c.doc for c in chunks}, file_doc
 
 
@@ -364,3 +364,39 @@ def test_an_rst_heading_is_skipped_for_the_paragraph_after_it():
     module = '"""\nTagged JSON\n~~~~~~~~~~~\n\nA compact representation for\nnon-standard JSON types.\n"""\n'
     assert parse("python", module + "def f():\n    pass\n")[3] == "A compact representation for non-standard JSON types."
     assert parse("python", '"""\nOnly a heading\n==============\n"""\n')[3] == "Only a heading =============="
+
+
+# --- language coverage (012): the parse shape, exported, lazy grammars ---
+
+import subprocess  # noqa: E402
+import sys  # noqa: E402
+
+
+@pytest.mark.parametrize(("language", "text"), [
+    ("python", PY_SOURCE), ("go", GO_DOCS), ("javascript", "function f() {}\n")])
+def test_parse_returns_namespaces_last(language, text):
+    parsed = parse(language, text)
+    assert len(parsed) == 5 and parsed[4] == []
+
+
+@pytest.mark.parametrize(("language", "text", "expected"), [
+    ("python", "def run():\n    pass\n\n\ndef _hidden():\n    pass\n\n\nclass A:\n    def _m(self):\n        pass\n",
+     {"run": True, "_hidden": False, "A": True, "A._m": False}),
+    ("go", "package p\n\nfunc Serve() {}\n\nfunc helper() {}\n\ntype T struct{}\n\nfunc (t T) close() {}\n",
+     {"Serve": True, "helper": False, "T": True, "T.close": False}),
+    ("javascript", "function run() {}\nfunction _hidden() {}\nclass A {\n  _m() {}\n  b() {}\n}\n",
+     {"run": True, "_hidden": False, "A": True, "A._m": False, "A.b": True}),
+])
+def test_exported_follows_the_name_rule(language, text, expected):
+    assert {c.name: c.exported for c in chunk(language, text)} == expected
+
+
+def test_windows_have_no_exported():
+    assert {c.exported for c in windows("x", numbered(70))} == {None}
+
+
+def test_new_grammars_load_only_when_used():
+    code = ("import sys, golestan_code_mcp.chunker, golestan_code_mcp.ingest, golestan_code_mcp.server;"
+            "print(sorted({m.split('.')[0] for m in sys.modules if m.startswith('tree_sitter_')}))")
+    out = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, check=True).stdout.strip()
+    assert out == "[]"  # every grammar loads on the first file of its language

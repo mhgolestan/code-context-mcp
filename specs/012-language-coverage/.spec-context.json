@@ -3,7 +3,7 @@
   "specName": "Language Coverage",
   "branch": "012-language-coverage",
   "currentStep": "implement",
-  "status": "implemented",
+  "status": "completed",
   "history": [
     {
       "step": "specify",
@@ -400,6 +400,13 @@
       "kind": "complete",
       "by": "extension",
       "at": "2026-10-13T11:43:45.102Z"
+    },
+    {
+      "step": "implement",
+      "substep": null,
+      "kind": "complete",
+      "by": "extension",
+      "at": "2026-10-14T09:01:39.064Z"
     }
   ],
   "telemetryInstanceId": "d377a0cb-7080-4126-89b6-72e1f9d179ec",

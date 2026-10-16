@@ -1,3 +1,5 @@
+"""The database check: connecting, the version and vector check, and exit codes."""
+
 import time
 
 import oracledb

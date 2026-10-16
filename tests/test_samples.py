@@ -1,3 +1,5 @@
+"""Cloning the sample repositories: where they go, skipping what is there, and refusals."""
+
 import subprocess
 
 import pytest

@@ -5,22 +5,7 @@ from pathlib import Path
 
 import pytest
 
-from golestan_code_mcp import db, registry, schema
-from golestan_code_mcp.config import load
-
-
-@pytest.fixture(scope="module")
-def conn():
-    try:
-        conn = db.connect(load())
-    except Exception as e:  # config missing or database down: skip, never fail
-        pytest.skip(f"database unreachable: {type(e).__name__}")
-    schema.migrate(conn)
-    yield conn
-    with conn.cursor() as cur:
-        cur.execute("delete from ccctx_repos where name like 't-%'")
-    conn.commit()
-    conn.close()
+from golestan_code_mcp import registry
 
 
 def name():

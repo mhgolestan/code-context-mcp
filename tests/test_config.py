@@ -1,3 +1,5 @@
+"""Configuration: settings from the environment and .env, their defaults, and refused values."""
+
 import pytest
 
 from golestan_code_mcp.config import (

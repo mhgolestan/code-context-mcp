@@ -249,9 +249,11 @@ MIGRATIONS: list[tuple[int, str, list[str]]] = [
 
 
 def _package_schema(conn) -> None:
-    from golestan_code_mcp import memory  # late: loading schema must not load memory or the package
+    from golestan_code_mcp.memory import (
+        store,  # late: loading schema must not load memory or the package
+    )
 
-    memory.create_package_schema(conn)
+    store.create_package_schema(conn)
 
 
 def _run(cur, statement) -> None:

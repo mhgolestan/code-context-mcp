@@ -1,8 +1,10 @@
 [project]
 name = "golestan-code-mcp"
-version = "1.4.1"
+version = "1.4.2"
 description = "Code context MCP server backed by Oracle AI Database 26ai"
 readme = "README.md"
+license = "MIT"
+license-files = ["LICENSE"]
 requires-python = ">=3.11"
 dependencies = [
     "mcp[cli]>=1.12,<2",
@@ -35,11 +37,25 @@ ccctx = "golestan_code_mcp.cli:main"
 dev = ["pytest>=8"]
 
 [build-system]
-requires = ["hatchling"]
-build-backend = "hatchling.build"
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
 
-[tool.hatch.build.targets.wheel]
-packages = ["src/golestan_code_mcp"]
+# src/ itself is the package golestan_code_mcp. setuptools, unlike hatchling, can install that mapping editable.
+# tests/test_layout.py checks that every package folder is listed here.
+[tool.setuptools]
+package-dir = {"golestan_code_mcp" = "src"}
+packages = [
+    "golestan_code_mcp",
+    "golestan_code_mcp.cli",
+    "golestan_code_mcp.graph",
+    "golestan_code_mcp.indexing",
+    "golestan_code_mcp.memory",
+    "golestan_code_mcp.parsing",
+    "golestan_code_mcp.parsing.languages",
+    "golestan_code_mcp.search",
+    "golestan_code_mcp.server",
+    "golestan_code_mcp.wiki",
+]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

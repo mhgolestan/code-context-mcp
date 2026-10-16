@@ -1,803 +1,104 @@
 # golestan_code_mcp
 
-A code context MCP server backed by Oracle AI Database 26ai. It indexes codebases into the database, searches them by name and meaning, follows their calls, writes and maintains a wiki page about each module, and serves all of it to AI coding tools over MCP (`ccctx mcp`).
+A code context MCP server backed by Oracle AI Database 26ai. It indexes codebases into the database, cut at function
+and class boundaries. It searches them by name and by meaning, follows their calls, keeps a wiki page about each
+module, and remembers what earlier sessions learned. It serves all of it to AI coding tools such as Claude Code, Codex
+and Cursor over the Model Context Protocol (MCP), so an agent can find and understand code without reading whole files.
 
-## Prerequisites
+The idea was initiated by the article [Coding Challenge #139 - Code Context](https://codingchallenges.substack.com/p/coding-challenge-139-code-context)
+from Coding Challenges. The project was developed with the help of [GitHub Spec Kit](https://github.github.com/spec-kit/):
+every feature went through a specification, a plan and a task list, kept in [`specs/`](specs/).
 
-- Docker (tested with Rancher Desktop), with about 12 GB free for the database image and data
-- [uv](https://docs.astral.sh/uv/) (it installs Python 3.11 for you if needed)
-- git
-- Node.js, only for the MCP Inspector (`npx`)
+It is free to use, change and share under the [MIT License](LICENSE).
 
-## Setup
+## Features
 
-Every command below is the same in PowerShell and a POSIX shell unless shown otherwise. Run them from the project root.
+- **Structure-aware indexing** of 13 languages (Python, Go, JavaScript, TypeScript, C#, C, C++, Java, Kotlin, Rust,
+  PHP, Ruby, Swift): one chunk per definition, with its exact lines and documentation. Re-ingesting only reads what
+  changed.
+- **Hybrid search**: keyword and semantic matching fused in one database index, with each result's scores shown.
+- **Code graph**: callers, callees and the transitive impact of a change, as a SQL property graph.
+- **Module wiki**: one page per module, written from the index, with citations that follow the code and pages that
+  are rewritten when it changes.
+- **Agent memory**: every tool call is recorded and distilled into facts a new session can recall.
+- **Usage feedback**: results that clients used rank a little higher, with a bounded, decaying boost.
+- **Private by default**: embeddings are computed inside the database, so no source code is sent out to be indexed
+  and no API key is needed.
 
-**1. Create your `.env`.** Copy the example, then replace both passwords. Oracle passwords need at least 8 characters with an upper-case letter, a lower-case letter and a digit.
+## Quick start
 
-```powershell
-Copy-Item .env.example .env     # PowerShell
-```
-```sh
-cp .env.example .env            # POSIX
-```
+You need Docker (tested with Rancher Desktop) with about 12 GB free, [uv](https://docs.astral.sh/uv/) and git.
+The commands are run from the project root; [Setup](docs/setup.md) has the details and the PowerShell variants.
 
-`.env` is ignored by git. No script prints its passwords.
-
-**2. Start the database.** It runs as the container `oracle26ai` on port 1521. The first start creates the database and the application user, which takes a minute or two.
+**1. Configure and start the database.** Copy `.env.example` to `.env` and replace both passwords. Then:
 
 ```sh
 docker compose up -d
-docker ps
-docker logs oracle26ai | tail -5     # look for DATABASE IS READY TO USE!
-```
-
-If port 1521 is taken, set `DB_PORT` in `.env` before starting.
-
-**3. Install the Python project.**
-
-```sh
 uv sync
+uv run golestan-check-db       # waits for the first start, then checks the connection
 ```
 
-**4. Check the database.** This waits up to 5 minutes for a first start, then prints the connection, the version, the vector check and the smoke table's row count.
+**2. Index a repository.** [Indexing](docs/indexing.md) explains what is read and how re-ingesting works.
 
 ```sh
-uv run golestan-check-db
+uv run golestan-clone-samples                         # optional: flask and gin, into ../ccctx-repos
+uv run ccctx repo add ../ccctx-repos/flask --name flask
+uv run ccctx model load                               # once: the embedding model and the search index
+uv run ccctx ingest flask
 ```
 
-Exit codes: `0` ok, `1` a setting is missing, `2` unreachable or still starting, `3` connected but the `VECTOR` check failed.
-
-**5. Clone the sample repositories.** Flask (Python) and Gin (Go) go to `../ccctx-repos` by default (set `CCCTX_REPOS_DIR` to change it; it must be outside this project). Running it again skips what is already there.
+**3. Search it.** See [Search](docs/search.md) and [Code relationships](docs/graph.md).
 
 ```sh
-uv run golestan-clone-samples
+uv run ccctx search "how are incoming requests routed to handlers"
+uv run ccctx callers url_for
+uv run ccctx wiki build --repo flask
 ```
 
-**6. Run the tests.** Database tests are skipped, with a reason, when the database is down. The parser tests always run.
+**4. Connect an AI coding tool.** Install the command once, then register it. For Claude Code:
+
+```sh
+uv tool install --editable .
+claude mcp add ccctx -- ccctx mcp
+```
+
+Any MCP client can start `ccctx mcp` the same way. [The MCP server](docs/mcp-server.md) has the details.
+
+**Upgrading from 1.4.1 or earlier.** The source moved from `src/golestan_code_mcp/` to `src/`, so an existing install must be refreshed once: close the MCP clients that run `ccctx` (on Windows they keep `ccctx.exe` locked), then run `uv sync` and `uv tool install --editable . --reinstall`. Registrations stay as they are.
+
+**5. Run the tests.** Database tests are skipped, with a reason, when the database is down.
 
 ```sh
 uv run pytest
 ```
 
-## Registering codebases
+## MCP tools
 
-`ccctx` records the codebases to index. The schema (tables `ccctx_repos`, `ccctx_files`, `ccctx_symbols` and `ccctx_migrations`) is created the first time any `ccctx` command runs, or explicitly with `uv run ccctx db migrate`.
-
-```sh
-uv run ccctx repo add ../ccctx-repos/flask --name flask
-uv run ccctx repo add ../ccctx-repos/gin --name gin
-uv run ccctx repo list
-```
-
-```text
-NAME   PATH                         FILES  SYMBOLS
-flask  /home/you/ccctx-repos/flask      0        0
-gin    /home/you/ccctx-repos/gin        0        0
-```
-
-Paths are stored absolute, with `~` and `..` resolved. Names are 1 to 64 lowercase letters, digits, `-` or `_`. A name or directory can be registered only once. Registering only checks that the path is a directory; it never reads or runs anything inside it.
-
-Exit codes: `0` ok, `1` refused input or a missing setting, `2` the database is unreachable or still starting.
-
-## Ingesting a codebase
-
-`ccctx ingest <name>` indexes a registered git repository as it is on disk. It needs the embedding model and the hybrid index (see [Searching code](#searching-code)) and refuses to run without it. The first ingest indexes everything and prints a summary:
-
-```sh
-uv run ccctx ingest flask
-```
-
-```text
-Scanned   236 files
-Skipped     5 files (5 binary)
-Indexed 1,353 symbols in 653.3s
-Fallback  148 files as line windows (148 no grammar, 0 parse errors)
-```
-
-Almost all of that time is the database embedding every symbol for the hybrid index when the ingest commits. On the Free edition container this is CPU-limited, about half a second per symbol.
-
-Later ingests only do the work the changes require. Each repository records the commit it was last indexed at. The next ingest asks git what differs from that commit, adds untracked files and paths that have gone, and compares each file's content hash with what is stored. Only added and changed files are parsed again, and inside a changed file only the functions and classes whose code changed are embedded again: the rest keep their rows and just move to their new lines. Files that were deleted, renamed away, newly ignored, or now too large or binary lose their symbols, so no search result can point at code that is no longer there. Everything else is left alone.
-
-```text
-Changed     9 files (2 added, 6 changed, 1 removed)
-Unchanged 227 files
-Skipped     0 files
-Indexed    84 symbols in 6.3s
-```
-
-A rename counts as one file removed and one added. `Skipped` and `Fallback` count only the files that run read.
-
-After an upgrade that understands a new language, the next ordinary ingest also reads again the unchanged files of that language, which were windows until then, and says so. They count as changed:
-
-```text
-Reparsed   46 files whose language is now understood (46 csharp)
-```
-
-When nothing changed:
-
-```text
-flask is already up to date at d086db856be1; run with --full to re-index anyway
-```
-
-`ccctx ingest <name> --full` throws the repository's index away and rebuilds it, like the first ingest. Use it after changing `CCCTX_VENDOR_DIRS` or `CCCTX_MAX_FILE_BYTES`, or after an upgrade that changes how code is chunked: an incremental run only looks at files whose content changed, so it will not re-apply new rules to the rest. Ingest also rebuilds in full on its own, with a note on stderr, when no revision is recorded (a repository indexed before this feature) or when the recorded commit no longer exists (history rewritten, or the clone replaced).
-
-A failed ingest changes nothing: the index and the recorded commit stay as they were.
-
-How files are chosen:
-
-- **Ignored**: files matched by the repository's `.gitignore` rules, nested ones included, as git applies them. Also symbolic links. `.git` is never read.
-- **Vendored**: files under a directory named in `CCCTX_VENDOR_DIRS`, comma-separated, default `vendor,node_modules,third_party`.
-- **Too large**: files over `CCCTX_MAX_FILE_BYTES`, default 1048576.
-- **Binary**: files that contain a NUL byte or are not valid UTF-8.
-
-Code in thirteen languages is cut into one chunk per definition. Each chunk has its exact line range, decorators, attributes and annotations included, its doc comment's first paragraph as its documentation, and whether its language counts it as public. Its calls and imports feed the code graph and the wiki.
-
-| Language | Files | Definitions |
-|---|---|---|
-| Python | `.py` | functions, classes, methods |
-| Go | `.go` | functions, methods, struct and interface types |
-| JavaScript | `.js`, `.mjs`, `.cjs`, `.jsx` | functions (and functions bound to a `const`), classes, methods |
-| TypeScript, TSX | `.ts`, `.mts`, `.cts`; `.tsx` | the JavaScript ones, plus interfaces, type aliases and enums |
-| C#  | `.cs` | classes, records, structs, interfaces, enums, methods, constructors |
-| C, C++ | `.c`; `.cpp`, `.cc`, `.cxx`, `.c++`, `.hpp`, `.hh`, `.hxx`, `.h` | functions, classes, structs, unions, enums, typedefs, methods |
-| Java | `.java` | classes, records, interfaces, enums, methods, constructors |
-| Kotlin | `.kt`, `.kts` | classes, objects, interfaces, enums, functions, methods, extension functions |
-| Rust | `.rs` | functions, structs, enums, traits, type aliases, `impl` methods |
-| PHP | `.php` | classes, interfaces, traits, enums, functions, methods |
-| Ruby | `.rb`, `.rake`, `Rakefile`, `Gemfile` | modules, classes, methods |
-| Swift | `.swift` | classes, structs, enums, protocols, functions, methods, `init` |
-
-How definitions are named and kinded:
-- **Names**: a definition is named after the types that enclose it, joined with dots (`DriverFixture.GetWebDriver`, `Outer.Inner.run`). Namespaces and packages are left out of names, as Go packages are: C# and C++ namespaces, Java and Kotlin packages, PHP namespaces and Rust modules. Ruby modules and Kotlin objects hold code of their own, so they are part of names (`Acme.Parser.parse`).
-- **Members defined outside their type** are named after it: C++ `void Engine::start()` is `Engine.start`, using the last qualifier; Rust `impl Shape for Circle { fn area }` is `Circle.area`; a Swift `extension Circle` adds `Circle.area`; a Kotlin `fun String.slug()` is the method `String.slug`; a Kotlin companion object's functions are its class's.
-- **Kinds**: the existing seven. Structs, enums, unions and type aliases are `type`; interfaces, protocols and traits are `interface`; records, Kotlin objects and Ruby modules are `class`.
-- **Not definitions**: declarations without a body (C and C++ prototypes, interface and abstract members), properties, fields and constants. They stay in their type's chunk.
-- **`.h` files** are read as C++, which reads most C.
-
-Other text files, and code with a syntax error, are cut into 60-line windows that overlap by 10 lines, with kind `chunk`. Every symbol records the commit the repository was at when its file was last read. A working tree with uncommitted changes is indexed as it is on disk, and a warning is printed. One JSON record per run goes to stderr, with the mode (`full`, `incremental` or `current`) and the added, changed, removed and unchanged counts.
-
-Ingestion only reads files. Git runs with the repository's fsmonitor and hooks disabled, so nothing inside the repository is executed.
-
-Known limits of the new languages:
-- **Kotlin**: its grammar fails on some one-line class bodies that hold a function (`interface Shape { fun area(): Double }` followed by another declaration). Such a file falls back to windows and is counted as a parse error. The same code over several lines parses.
-- **Syntax only, as for every language**: calls resolve by name, with no type inference or overload resolution. There is no C or C++ preprocessor, so `#ifdef` branches are parsed as written and macros aren't expanded; no build-system include paths; and Rust macro arguments aren't searched for calls.
-- **Imports resolve to files by path rules**:
-  - C and C++ `#include "..."`: beside the file first, then anywhere in the repository.
-  - Java and Kotlin: packages map to folders.
-  - Rust: `mod` and `use crate::`.
-  - PHP: `require`, and PSR-4 for `use`.
-  - Ruby: `require_relative`.
-  - TypeScript: relative imports.
-  - C#: `using N` reaches the files that declare namespace `N`.
-  - Swift: imports are modules, so Swift files depend on no file.
-
-  Anything else is an outside dependency.
-
-Inspect the result:
-
-```sh
-uv run ccctx symbols --repo flask --limit 5      # parsed symbols first; --kind chunk shows windows
-uv run ccctx stats --by-language                 # files, symbols and fallback chunks per repo and language
-```
-
-## Searching code
-
-Search combines keyword matching and semantic matching, both served by one hybrid vector index in the database. The database embeds code itself with Oracle's prebuilt ONNX `all_MiniLM_L12_v2` model, loaded as `ALL_MINILM_L12_V2`. There is no API key and no network call at search time, and source code never leaves the database to be embedded.
-
-**1. Set up the model and the index once.** This step:
-
-- downloads the 133 MB model file into `.cache/models/` (git-ignored)
-- loads it with `DBMS_VECTOR.LOAD_ONNX_MODEL` and records its name and dimension
-- builds the hybrid vector index over every symbol's kind, name, path and source
-
-Building the index takes several minutes for flask and gin together. Running the command again does nothing. If you already ran it before hybrid search existed, run it once more: that builds the new index, and the symbols you already ingested are searchable without re-ingesting.
-
-```sh
-uv run ccctx model load
-```
-
-Check it from SQL:
-
-```sql
-SELECT model_name FROM user_mining_models;                                   -- ALL_MINILM_L12_V2
-SELECT VECTOR_EMBEDDING(ALL_MINILM_L12_V2 USING 'hello world' as data) AS v;  -- 384 numbers
-```
-
-`CCCTX_MODEL_URL` and `CCCTX_MODEL_CACHE` change where the file comes from and where it is kept.
-
-The index's vector half lives in the database's vector memory pool. The first container start after vector search was added sets the pool to 256 MB and restarts the database once (`db/startup/02_vector_memory.sh`). Later starts leave it alone. The index updates when an ingest commits, so a finished ingest is searchable at once.
-
-**2. Search.**
-
-```sh
-uv run ccctx search "url_for"                                       # the definition comes first
-uv run ccctx search "url_for" --mode text                           # only symbols containing url_for
-uv run ccctx search "how are incoming requests routed to handlers"  # by meaning
-uv run ccctx search "middleware chain" --repo gin                   # one repository
-uv run ccctx search "routing" --repo flask,gin                      # or several (also: --repo flask --repo gin)
-uv run ccctx search "middleware chain" --language go --limit 3      # one language, three results
-```
-
-```text
-RANK  SCORE  FEEDBACK  KEYWORD  SEMANTIC  REPO   KIND      NAME           PATH                     LINES
-   1  24.38                  5         4  flask  method    Flask.url_for  src/flask/app.py         1102-1222
-   2  21.82                  6         7  flask  function  url_for        src/flask/helpers.py     200-251
-   4  29.69                  1        11  flask  class     TestUrlFor     tests/test_helpers.py    94-161
-```
-
-Modes, chosen with `--mode`:
-
-- **`hybrid`** (default): keyword and semantic results fused with reciprocal rank fusion (`DBMS_HYBRID_VECTOR.SEARCH` with `RRF` and `UNION`). A symbol that both rank highly rises to the top. The keyword side matches any word of the query, and plain words also match their stems (`routed` finds `route`).
-- **`text`**: keyword matching only. Every word of the query must appear.
-- **`vector`**: meaning only.
-
-How results are ranked:
-
-- **Definitions first**: when the query is an identifier, the symbols named exactly that, or ending in `.<identifier>` such as `Flask.url_for`, come before everything else in `hybrid` and `text` mode. Matching ignores case.
-- **Similarity floor**: a result found only by meaning must have a cosine similarity of at least 0.3, so an unrelated question returns nothing rather than ten weak matches. Keyword matches always count.
-- **One window per file**: of a file's fallback line windows, only the best one is shown.
-- **10 results by default**, `--limit` 1 to 50. `--language` keeps one language (`python`, `go`, `javascript`, `markdown` and the other languages the chunker assigns). Query text is always taken literally: `_`, `-`, `&`, quotes and parentheses are never search operators.
-- **Usage feedback**: results that clients used get a small boost, at most 20%, that fades over 30 days (see Usage feedback). `--no-feedback` ranks without it.
-- **Why each result ranked**: `SCORE` is the fused score (or the single side's score in `text` and `vector` mode), raised by `FEEDBACK` when the result was used (`+4%`; blank when there is none). `KEYWORD` and `SEMANTIC` are its rank on each side among the repositories searched, with `-` when that side did not find it.
-
-Fusion settings:
-
-| Setting | Default | Meaning |
-|---|---|---|
-| `CCCTX_TEXT_WEIGHT` | `1` | Weight of the keyword side in the fusion |
-| `CCCTX_VECTOR_WEIGHT` | `1` | Weight of the semantic side in the fusion |
-| `CCCTX_SEARCH_CANDIDATES` | `100` | Rows asked of the index before scoping and the result cap; widened automatically, up to 4000, when `--repo` filters most of them out |
-
-## Code relationships
-
-Ingest records three relationships from the parse tree of every file in a language it understands (see the table under Ingesting a codebase):
-
-- **defines**: the file each symbol is in.
-- **imports**: the files of the same repository a file imports.
-- **calls**: the symbol (or, for a module-level call, the file) making each call, the symbol called, and the line.
-
-They form `ccctx_graph`, a SQL property graph (`CREATE PROPERTY GRAPH`) over the existing tables: files and symbols are its vertices, and imports, calls and defines its edges. Nothing is copied. Three commands query it with `GRAPH_TABLE … MATCH`:
-
-```sh
-uv run ccctx callers url_for                 # what calls this?
-uv run ccctx calls url_for                   # what does this call?
-uv run ccctx impact url_for --depth 3        # what could break: transitive callers, with hop counts
-```
-
-```text
-CALLER          KIND      REPO   PATH                              LINE  CALLS
-login_required  function  flask  examples/tutorial/flaskr/auth.py    25  url_for
-...
-url_for         function  flask  src/flask/helpers.py               244  Flask.url_for
-
-FROM           LINE  CALLEE                    KIND    REPO   PATH                 LINES
-Flask.url_for  1182  Flask.create_url_adapter  method  flask  src/flask/app.py     507-558
-url_for         244  Flask.url_for             method  flask  src/flask/app.py     1102-1222
-
-HOPS  NAME            KIND      REPO   PATH                              LINES
-   1  login_required  function  flask  examples/tutorial/flaskr/auth.py  19-29
-```
-
-- **Names** are case-sensitive. A bare name (`url_for`) matches every function, method, class or type named `url_for` or `<something>.url_for`. A qualified name (`Flask.url_for`) matches only that definition. `CALLS` says which definition each call reaches.
-- **`--depth`** is 1 to 5, default 3. Each symbol appears once, at its shortest distance, nearest first. Recursion and cycles are safe.
-- **`--repo`** limits a command to the named repositories, as in search. Calls never cross repositories.
-- The model is not needed, and ingest keeps the graph current: an incremental ingest leaves the same relationships as `--full`.
-
-On flask, `ccctx callers url_for` finds all 51 calls to `url_for` inside functions and methods. `grep -rn url_for` finds 187 lines, but 136 of them are documentation, templates, comments, docstrings, strings and imports, and none of those appear. `impact url_for` stays at 36 symbols from depth 1 to 5: they are tests and view functions, which pytest and the router call, never other code. `impact Flask.url_for` grows from 1 symbol at depth 1 to 36 at depth 3.
-
-Calls are matched to definitions by name, not by type inference:
-
-- `x()` reaches functions and classes named `x`. In C#, Java, Kotlin, Swift, C++ and Ruby, where a method can call its own type's methods without a receiver, `x()` first reaches the enclosing type's method `x`.
-- `module.x()` on an imported module of the repository is treated the same way.
-- `self.x()` (and `this.x()`, `$this->x()`, `base.x()`, `Self::x()`) prefers the method of the enclosing class. `::` and `->` receivers read as dots.
-- `obj.x()` reaches every method named `x`.
-- A definition in the same file wins, then one in a file the caller imports, then any in the repository.
-
-Dynamic calls, calls through variables, and the code a framework calls for you are not edges. Files indexed as line windows have no relationships.
-
-The first ingest after upgrading re-reads every file for its relationships. Unchanged symbols keep their rows, so nothing is re-embedded: flask took 1.7 s.
-
-## Module wiki
-
-Search answers narrow questions such as "where is `url_for` defined?". It is weaker at "what does this module do?", because no single chunk says that. So the tool writes it down: one page for each directory whose own files hold at least 10 parsed definitions (line windows do not count).
-
-```sh
-uv run ccctx wiki build --repo flask      # without --repo: every indexed repository
-uv run ccctx wiki list --repo flask
-uv run ccctx wiki show flask/json
-uv run ccctx wiki citations flask/json
-```
-
-**Page names.** A page is named after its directory, with a leading `src/` dropped, so `src/flask/json` is `flask/json`. The repository's root directory is named after the repository. When two repositories have a page with the same name, pass `--repo`. flask gets 7 pages and gin 7, each built in under 3 seconds.
-
-**What a page says.** It is written from the index, by rules. No language model is involved and nothing leaves the database:
-- **Opening sentence:** what the directory is and what it holds, counted from the index.
-- **Purpose:** the directory's own documentation: module docstrings, Go package comments, or else the docs of its main types. A directory without documentation says so instead of guessing.
-- **Key symbols:** up to 10, each with the first sentence of its doc.
-  - Order: types first, then by how much code in other directories calls them.
-  - Code in test files comes after the rest, and exported, documented symbols come before private ones.
-- **Depends on:** the modules it imports, from the import edges, with the symbols it calls in each, then the packages it imports from outside the index.
-- **Used by:** the modules that import it.
-
-```text
-flask/json (flask, src/flask/json) fresh, compiled 2026-10-11 21:51:36 by ccctx-wiki/1
-
-# flask/json
-
-`flask/json` is a Python package of 3 files and 62 definitions: 44 methods, 12 classes and 6 functions.
-A compact representation for lossless serialization of non-standard JSON types. SecureCookieSessionInterface uses this to serialize the session data, but it may be useful in other places. It can be extended to support other types.
-
-## Key symbols
-- `TaggedJSONSerializer` (class): Serializer that uses a tag system to compactly represent objects that are not JSON types.
-- `JSONProvider` (class): A standard set of JSON operations for an application.
-- `jsonify` (function): Serialize the given arguments as JSON, and return a Response object with the application/json mimetype.
-- `dumps` (function): Serialize data as JSON.
-...
-
-## Depends on
-- `flask`: `_AppCtxGlobals.setdefault`
-- Outside the index: `base64`, `dataclasses`, `datetime`, `decimal`, `json`, `markupsafe`, `typing`, `uuid`, `weakref`, `werkzeug`
-
-## Used by
-- `flask`, `flask/sansio`, `tests`
-
-## Sources
-- `JSONProvider` (class, key) src/flask/json/provider.py:19-105
-- `dumps` (function, key) src/flask/json/__init__.py:13-44
-...
-```
-
-**Citations are references, not text.** The stored page names symbols and modules but never contains a path or a line number. Every symbol or file a page names is a row in `ccctx_wiki_citations` with a foreign key to its `ccctx_symbols` or `ccctx_files` row, plus the commit and content hash it had when the page was compiled. The `Sources` list and `ccctx wiki citations` are read through those keys, so they always show where the code is now:
-
-```text
-NAME                 KIND      ROLE  REPO   PATH                        LINES    COMPILED      CURRENT
-DefaultJSONProvider  class     key   flask  src/flask/json/provider.py  124-215  d086db856be1  d086db856be1
-JSONProvider         class     key   flask  src/flask/json/provider.py  19-105   d086db856be1  d086db856be1
-```
-
-A citation can point at the right record or, once that record is deleted, at nothing. It cannot point at the wrong one.
-
-**Stale pages are marked and rewritten.** When an ingestion changes the commit of a symbol a page cites, or removes it, that page is marked stale in the same transaction. After the ingest commits, the stale pages are recompiled. Pages that cite nothing that changed are left alone. If the recompile fails, the ingestion still stands, and the page stays marked stale wherever it is shown. Try it in the flask sample, then undo the tweak with `git revert HEAD` and ingest again:
-
-```sh
-cd ../ccctx-repos/flask
-# edit a function the flask/json page cites, such as dumps in src/flask/json/__init__.py
-git commit -am "tweak"
-cd -
-uv run ccctx ingest flask
-uv run ccctx wiki list --repo flask
-```
-
-```text
-Changed     1 files (0 added, 1 changed, 0 removed)
-Unchanged 230 files
-Skipped     0 files
-Indexed     1 symbols in 4.1s
-Wiki      flask/json stale: dumps changed (844a13f0be01 -> b2ca8484760e), recompiled
-Wiki      tests stale: dumps changed (844a13f0be01 -> b2ca8484760e), recompiled
-Wiki      2 stale, 2 recompiled, 0 added, 0 removed
-```
-
-Each `Wiki` line names a page that went stale and why: `<name> changed (<old> -> <new>)`, `<name> is gone`, or `<name> was re-indexed` after a full re-ingest. The `tests` page counts here because it cites `dumps` as a symbol it calls. `wiki list` keeps the last reason in its `LAST STALE` column. Ingestion only does this for repositories whose wiki was built once. It also adds pages for directories that now qualify and removes the ones that no longer do.
-
-Ingestion stamps every symbol of a changed file with the new commit. So editing any function in a file a page cites marks the page stale, which errs toward rewriting a page rather than leaving it wrong.
-
-**Pages in search.** Pages have their own hybrid index, built by `ccctx model load` or by the first `wiki build`, and search returns them beside symbols. A page hit has kind `page`, its directory as the path and no line range. `page (stale)` marks a page waiting to be rewritten. A page is placed above the first hit whose semantic similarity is lower than its own. A question that names a module, such as "the json module" or "package binding", puts that page first. The definitions of an exact identifier still come first.
-
-| Question | First hit |
+| Tool | Answers |
 |---|---|
-| what does the json module do | page `flask/json`, then gin's `codec/json` |
-| what does the sansio module do (`--repo flask`) | page `flask/sansio` |
-| what does the binding package do (`--repo gin`) | page `binding` |
-| what does the render package do (`--repo gin`) | page `render` |
+| `search_code` | Find code, wiki pages and remembered facts by name or by meaning |
+| `get_symbol` | The full source of a definition |
+| `find_callers` | What calls a function or method |
+| `find_callees` | What a function or method calls |
+| `impact_of` | What could break if a definition changes |
+| `read_wiki` | What a module does, from its wiki page |
+| `list_repositories` | The indexed repositories |
+| `recall` | What earlier sessions worked out |
+| `mark_used` | Record that a result helped |
 
-**Upgrading.** This version stores module docstrings and doc comments, which earlier versions did not. The first ingest of each repository after upgrading re-reads every file to fill them in. Unchanged symbols are kept, so nothing is re-embedded. Then run `ccctx wiki build` once.
+Parameters, results and the change history are in [The MCP server](docs/mcp-server.md).
 
-## Agent memory
+## Documentation
 
-The server remembers what it has been asked, so a new session does not work the same things out again. Memory has
-three layers:
+- [Setup](docs/setup.md): prerequisites, the database, installing, checking that data persists
+- [Indexing](docs/indexing.md): registering and ingesting codebases, the languages and their limits
+- [Search](docs/search.md): search modes and ranking, usage feedback, evaluating retrieval
+- [Code relationships](docs/graph.md): callers, calls and impact
+- [Module wiki](docs/wiki.md): the module pages, their citations and how they stay current
+- [Agent memory](docs/memory.md): runs, facts, recall and the optional distilling model
+- [The MCP server](docs/mcp-server.md): the tools, registering clients, the change history
+- [CLAUDE.md](CLAUDE.md): commands, conventions and the file layout, for AI coding agents and contributors
 
-- **Runs.** Every MCP tool call is recorded with its arguments, the client that asked, the status, and the identity
-  and location of each result. A run never holds source code or snippets. Recording happens on a background thread:
-  it never delays or changes an answer, and a failure to record is only logged. CLI commands are not recorded.
-- **Facts.** `ccctx memory consolidate` distils the runs into facts, one per piece of code (a symbol or a wiki page)
-  per repository. Each fact has a subject, its text, a confidence, the IDs of the runs it came from, and references to
-  the code it describes. Facts are stored with Oracle's AI Agent Memory package, in the `ccctx_mem_*` tables that
-  `ccctx db migrate` creates.
-- **Recall.** The `recall` tool hands the facts and the latest runs back. The server tells clients to call it at the
-  start of a session, and fresh facts also show up in `search_code` as hits of kind `fact`.
+## License
 
-```sh
-uv run ccctx memory list --repo flask --limit 10   # one row per tool call, newest first
-uv run ccctx memory consolidate --repo flask       # distil the runs not yet consolidated
-uv run ccctx memory facts --repo flask             # fresh first, then by confidence
-```
-
-```text
-flask: 20 runs read, 4 created, 15 merged, 1 weakened, 0 stale, 0 re-asked in 0.4s (template/1)
-```
-
-**Merging.** A run is about the code its first result points at, so two runs merge when they led to the same code,
-however the question was worded: "where is url_for defined" and "where's url_for defined?" give one `url_for` fact
-holding both wordings. A wording that later leads to other code moves to that code's fact, and the two facts are
-linked as contradicting each other.
-
-**Confidence** is `(1 - 0.5^agree) * 0.5^contradict`. One agreeing run gives 0.5, two give 0.75 and three give 0.875,
-and each contradiction halves it. A contradiction is a wording that moved, a finding that changed (for example a
-different caller count), a re-ask answered by other code, or the code being removed.
-
-**Keeping pace with the code.** Every `ccctx ingest` consolidates afterwards and prints a `Memory` line when anything
-happened. Before distilling new runs, each fresh fact is checked against the index:
-
-| The fact's code | What happens |
-|---|---|
-| unchanged | nothing |
-| moved, same content | the fact points at the new place |
-| edited | it is re-asked: the calls it came from run again against the new index (not recorded as runs). If the same code still answers, the fact stays fresh. If other code answers, it goes stale and its confidence halves. |
-| removed | the fact goes stale with `` `X` was removed `` and its confidence halves |
-
-A stale fact is shown as stale everywhere, is left out of search, and becomes fresh again only when a new run
-confirms it. A consolidation failure never undoes an ingestion: the summary says `Memory    not consolidated: <why>`.
-
-**The model that writes fact text (optional).** By default a template writes each fact from what the runs found,
-and nothing leaves the database. To have a language model write the text instead, set `CCCTX_MEMORY_MODEL` to a
-LiteLLM model string, plus its key in `CCCTX_MEMORY_MODEL_KEY` or the provider's usual variable:
-
-```sh
-CCCTX_MEMORY_MODEL=anthropic/claude-sonnet-5-5
-ANTHROPIC_API_KEY=...
-```
-
-For each fact it writes, the model is sent exactly this: the subject's name, kind and path; its source, at most 200
-lines; the findings (where it is defined, its caller, callee and reach counts and names); the names and locations of
-the related symbols; and the question wordings. Nothing else is sent, and search, chunking and embedding never send
-anything. The model only writes the text. Which code a fact is about, merging, confidence and staleness are decided the
-same way with or without it. Its text may name only code that appears in what it was sent; otherwise, and whenever
-the call fails, the template writes the fact. Each fact records which one wrote it (`template/1` or
-`llm:<model>`).
-
-**Removing a repository.** There is no `repo remove` command yet. When one is added, it must call `memory.forget`,
-which deletes the repository's facts. Runs that belonged only to it are deleted by the next consolidation.
-
-## Usage feedback
-
-The server learns which results helped, and lets that nudge later searches without ever overruling relevance.
-
-**What counts as a use.** A client calls `mark_used` with a hit's repository, path and name when it cites the hit or
-relies on it: a **cited** use. Reading a hit that this session's `search_code` returned, with `get_symbol` or
-`read_wiki`, is an **opened** use. A result gets at most one use per session; citing it after opening it leaves one
-cited use. Each use is linked to the search that returned it, so `ccctx memory list` shows `RESULTS` as
-`used/returned` (`2/10`). A use is keyed by the result's repository, path and name, so it survives a re-ingest, and it
-is recorded on the same background thread as runs: it never delays or changes an answer.
-
-**Weight and decay.** A cited use weighs 1 and an opened use 0.5. A use's weight halves every 30 days: 1.00 today,
-0.50 after 30 days, 0.25 after 60. A result's weight is the sum over its uses.
-
-**The boost.** `boost = cap * min(1, weight / 5)`: 4% per fresh citation, up to the cap at a weight of 5. A result's
-score becomes `relevance * (1 + boost)`. The boost only reorders what the search already found: it never adds a
-result, identifier definitions still come first, a page's similarity is raised the same way when it is placed, and
-facts are never boosted. A result 20% or more behind another can never pass it, so a heavily used symbol does not
-take over unrelated questions.
-
-| Setting | Default | Meaning |
-|---|---|---|
-| `CCCTX_FEEDBACK_CAP` | `0.2` | The largest boost, 0 to 1. `0` switches feedback off. |
-| `CCCTX_FEEDBACK_HALF_LIFE_DAYS` | `30` | Days after which a use counts half as much |
-
-```sh
-uv run ccctx feedback list --repo flask                                          # weight and boost per result
-uv run ccctx feedback add url_for --repo flask --path src/flask/helpers.py       # record a cited use by hand
-uv run ccctx feedback add redirect --repo flask --days-ago 30 --count 3          # backdated, several
-uv run ccctx feedback reset --repo flask                                         # or --all
-```
-
-```text
-KIND      NAME      PATH                  USES  WEIGHT  BOOST  LAST USED            INDEXED
-function  url_for   src/flask/helpers.py     1    1.00   +4%  2026-10-13 09:12:40  yes
-function  redirect  src/flask/helpers.py     3    1.50   +6%  2026-09-13 09:12:41  yes
-```
-
-`INDEXED` is `no` when the symbol or page is gone; such a use boosts nothing. `--path` is needed when the name is at
-several paths. Feedback never changes the index.
-
-## Evaluating retrieval
-
-`gold.json` is a versioned set of 20 plain-language questions about flask and gin, each with the files or
-directories that answer it. `ccctx eval` runs them and counts a question as a hit when any of its top 10 results is at
-an expected path (a directory matches the files under it):
-
-```sh
-uv run ccctx eval --gold gold.json                  # ranking without feedback
-uv run ccctx eval --gold gold.json --with-feedback  # with it: should hold or improve recall
-```
-
-```text
-Questions: 20
-recall@10: 0.90 (18/20)
-missed: how do tests send requests to the app without running a server?
-missed: how is HTTP basic authentication checked?
-```
-
-`--limit` changes the 10. Evaluating records no run and no use. The format is
-`{"version": 1, "questions": [{"question": "...", "repo": "flask", "paths": ["src/flask/app.py"]}]}`; `repo` is
-optional. Bump `version` when the questions or paths change. `tests/search/test_evaluation.py` keeps the baseline as a floor.
-
-## Checking that data persists
-
-`uv run pytest` adds a row to the `ccctx_smoke` table on each run. Note the count, restart the container, and check it again:
-
-```sh
-uv run golestan-check-db
-docker compose stop
-docker compose start
-uv run golestan-check-db --wait 300
-```
-
-The second count matches the first. `docker compose down` also keeps the data. Only `docker compose down -v` deletes it.
-
-## The MCP server
-
-`ccctx mcp` runs the server over standard input and output. There is no network port and no login: the client starts it as a child process. It finds its database settings the same way the CLI does, from the environment and then `.env` in this checkout, whatever directory the client starts it in.
-
-**Install the command once**, from the project root, so a client can start `ccctx` from any directory:
-
-```sh
-uv tool install --editable .
-```
-
-The editable install keeps `.env` in reach. With a non-editable install there is no `.env` next to the package, so give the settings to the client instead: `claude mcp add ccctx -e DB_USER=... -e DB_PASSWORD=... -- ccctx mcp`.
-
-**Tools.** Each tool's description says what it answers and when to use one of the others instead. All but `mark_used` are read-only.
-
-| Tool | Parameters | Returns |
-|---|---|---|
-| `search_code` | `query`, `repo`, `language`, `limit` (default 10, 1 to 50), `feedback` (default true) | Hits with repository, path, symbol name, kind, language, line range, a snippet (the first 10 lines, at most 800 characters) and the scores: `score`, `relevance` (the score before feedback), `feedback` (the boost, 0 to 0.2), and the keyword and semantic ranks. `feedback: false` ranks without usage feedback. The same hits as `ccctx search`, wiki pages included: a page hit has kind `page`, a `state`, its directory as `path` and a null line range. A fact hit has kind `fact`, its subject as the name, the subject's location, and the fact's text as the snippet. |
-| `get_symbol` | `name`, `repo` | Up to 5 definitions with that name, each with its full indexed source, path and line range. A source over 400 lines is cut and marked `cut`. `total` and `truncated` say whether more matched. |
-| `find_callers` | `name`, `repo` | The rows of `ccctx callers`. |
-| `find_callees` | `name`, `repo` | The rows of `ccctx calls`. |
-| `impact_of` | `name`, `depth` (default 3, 1 to 5), `repo` | The rows of `ccctx impact`, with hop counts. |
-| `read_wiki` | `page`, `repo` | With `page`: the page's text, state, compile time and compiler, and its citations, each with repository, path and line range, the same as `ccctx wiki show`. Without `page`: the pages with their state and first purpose sentence, at most 200. |
-| `list_repositories` | none | The registered repositories, the same as `ccctx repo list`. |
-| `recall` | `repo`, `topic`, `limit` (default 20, 1 to 50) | What earlier sessions worked out: the facts, fresh and most confident first or most related to `topic`, each with its text, confidence, state, run IDs and the location of its code, and the 10 newest runs. Never calls a model. |
-| `mark_used` | `repo`, `path`, `name` (all required) | Records that a hit helped (a cited use, see Usage feedback). Returns the result's `kind` and `linked`: whether a search in this session returned it. An unknown result is `unavailable` with `not found`. Idempotent. |
-
-- **Names** work as in the graph commands: a bare `url_for` matches every `url_for`, and `Flask.url_for` only that method.
-- **Limits:** the graph tools return at most 200 rows, with `truncated` set when there were more.
-- **Refusals:** bad input, an unknown repository or language, a missing model and a stopped database all come back as `"status": "unavailable"` with a reason. A call with an argument the tool does not take is refused.
-- **Logging:** each call writes one line to standard error with the tool, time, status and result count.
-- **Memory:** each call is also recorded as a run (see Agent memory). The server's instructions tell clients to call
-  `recall` first.
-
-**Changed in 1.4.1.** The code is reorganized into smaller files; no tool, command or stored value changed.
-
-**Changed in 1.4.0.** Ten more languages are understood: TypeScript, TSX, C#, C, C++, Java, Kotlin, Rust, PHP, Ruby and Swift. Their definitions are hits, `get_symbol`, `find_callers`, `find_callees` and `impact_of` find them, and `read_wiki` has pages for their folders. `search_code`'s `language` accepts the new values. No tool's shape changed.
-
-**Changed in 1.3.0.** `mark_used` is new. `search_code` hits have `relevance` and `feedback`, `score` includes the
-feedback boost, and `search_code` takes `feedback`. `get_symbol` and `read_wiki` record opened uses; their answers
-are unchanged. Nothing was removed or renamed.
-
-**Changed in 1.2.0.** `recall` is new, `search_code` can return `fact` hits, and the server sends instructions.
-Nothing was removed or renamed.
-
-**Changed in 1.1.0.** `read_wiki` is new, and `search_code` can return page hits: `start_line` and `end_line` may be null, and every hit has a `state` (null for a symbol). Nothing was removed or renamed.
-
-**Changed in 1.0.0.**
-- **Renamed tools:** `search` is now `search_code`, `callers` is now `find_callers`, `calls` is now `find_callees`, and `impact` is now `impact_of`.
-- **Removed:** `health`. A failed call says when the database is unreachable.
-- **Parameters:** the `repos` list became one `repo`, and `search` lost `question` (now `query`) and `mode` (always hybrid).
-- **Old registrations:** `golestan-code-mcp` still starts the same server.
-
-**MCP Inspector**: lists the tools and calls them by hand.
-
-```sh
-npx @modelcontextprotocol/inspector ccctx mcp
-```
-
-Open the URL it prints, connect, then **Tools → List Tools**. To compare with the CLI, call `search_code` with `{"query": "how are requests routed", "repo": "flask"}`: it returns the same 10 symbols in the same order as `ccctx search "how are requests routed" --repo flask`.
-
-**Claude Code**:
-
-```sh
-claude mcp add ccctx -- ccctx mcp
-```
-
-Start a session in any other directory and ask, for example, "using ccctx, how does Flask decide which view function handles a request?".
-
-**Which tool a client picks.** Five questions were run through Claude Code with `claude -p`, its built-in tools turned off and only this server connected. Each question was written so one tool is the right first step. The client called that tool first every time:
-
-| Question | First call | Then |
-|---|---|---|
-| using ccctx, how does Flask decide which view function handles a request? | `search_code` | `get_symbol` ×6, a narrower `search_code`, `find_callers` |
-| show me the full source of Flask.dispatch_request | `get_symbol` | none |
-| what calls url_for in flask? | `find_callers` | none |
-| if I change Flask.url_for, what could break? | `impact_of` | `get_symbol`, `find_callers`, `search_code` |
-| what does Flask.full_dispatch_request call? | `find_callees` | `get_symbol` |
-
-Its routing answer traced registration through `App.add_url_rule` into `url_map` and `view_functions`. It then traced each request through `Flask.wsgi_app`, `AppContext.match_request` and `Flask.dispatch_request`, citing paths and lines. It never asked to open a file.
-
-## Layout
-
-```text
-compose.yaml                    Oracle AI Database 26ai Free, named volume oradata
-db/startup/01_app_user.sh       every start: ensures DB_USER exists in FREEPDB1
-db/startup/02_vector_memory.sh  first start: enables the vector memory pool, restarts once
-src/golestan_code_mcp/
-  __init__.py                   the package and its version
-  config.py                     settings from the environment, with .env as a fallback
-  db.py                         the database connection, and golestan-check-db
-  registry.py                   register and list repositories (shared by the CLI and the MCP server)
-  samples.py                    golestan-clone-samples: clone the sample repositories
-  schema.py                     ordered, re-runnable migrations
-  parsing/                      tree-sitter chunks, calls, imports and docs; line-window fallback
-    __init__.py                 the area
-    tables.py                   the language tables, and register() for each language
-    common.py                   the chunk, call and import types; tree and doc helpers every language shares
-    chunks.py                   detect a file's language, parse it into chunks, or cut it into line windows
-    languages/                  one file per language
-      __init__.py               registers every language, in order
-      python.py                 Python's rules
-      go.py                     Go's rules
-      javascript.py             JavaScript's rules
-      csharp.py                 C#'s rules
-      typescript.py             TypeScript's and TSX's rules
-      c_family.py               C's and C++'s rules
-      java.py                   Java's rules
-      kotlin.py                 Kotlin's rules
-      rust.py                   Rust's rules
-      php.py                    PHP's rules
-      ruby.py                   Ruby's rules
-      swift.py                  Swift's rules
-  indexing/                     index one repository, in full or incrementally
-    __init__.py                 the area
-    files.py                    list files with read-only git; skip rules; read the ones to index
-    write.py                    store symbols, calls and imports; keep unchanged symbols
-    ingest.py                   ingest: plan, parse, write in one transaction, then the graph, wiki and memory
-  search/                       hybrid / text / vector search, usage feedback, the evaluation
-    __init__.py                 the area
-    model.py                    the embedding model, the hybrid index and the code lexer
-    candidates.py               the keyword query, and the symbol, page and definition rows a search starts from
-    ranking.py                  fuse the two sides, apply the usage boost, place wiki pages
-    query.py                    the search, its language and count filters, and its results
-    feedback.py                 usage feedback: uses, weights and decay, the bounded boost
-    evaluation.py               the gold evaluation (`ccctx eval`)
-  graph/                        call and import edges from stored refs; queries via GRAPH_TABLE
-    __init__.py                 the area
-    imports.py                  resolve imports to indexed files, per language; outside packages
-    build.py                    resolve calls to definitions, and rewrite a repository's edges
-    queries.py                  callers, calls, impact and definitions
-  wiki/                         module pages from the index: compile, cite, mark stale, recompile, read
-    __init__.py                 the area
-    text.py                     safe sentences from documentation, and readable lists of names
-    compile.py                  write one directory's page with its citations
-    store.py                    the pages' hybrid index, and writing pages
-    build.py                    build a repository's pages, mark them stale, recompile them
-    read.py                     list pages, and read one with its citations' current locations
-  memory/                       agent memory: record runs, distil facts, re-check, recall
-    __init__.py                 the area
-    store.py                    the AI Agent Memory package, its schema, and the configured model
-    runs.py                     record every tool call off the answering path, and list the runs
-    findings.py                 what one run says about its subject
-    distill.py                  a finding's text, from the template or a configured model
-    consolidate.py              turn pending runs into facts
-    recheck.py                  after an ingest, mark facts stale, repoint or re-ask them
-    recall.py                   list, recall and forget facts; fact hits in search
-  server/                       the nine MCP tools (`ccctx mcp`)
-    __init__.py                 loads the tools in listing order and refuses undeclared arguments
-    __main__.py                 `python -m golestan_code_mcp.server`
-    app.py                      the FastMCP app, and what every tool shares
-    search_tools.py             search_code and get_symbol
-    graph_tools.py              find_callers, find_callees and impact_of
-    wiki_tools.py               read_wiki
-    repository_tools.py         list_repositories
-    memory_tools.py             recall and mark_used
-  cli/                          the ccctx command
-    __init__.py                 the ccctx entry point
-    __main__.py                 `python -m golestan_code_mcp.cli`
-    entry.py                    parse, refuse bad input, connect, migrate and run a command
-    parser.py                   every subcommand and its options
-    output.py                   plain-text tables and the ingest summary
-    index_commands.py           repo, ingest, symbols, stats, model load, db migrate
-    search_commands.py          search, callers, calls, impact, eval
-    wiki_commands.py            wiki build, list, show, citations
-    memory_commands.py          memory list, consolidate, facts; feedback list, add, reset
-tests/                          the pytest suite; its folders mirror src/golestan_code_mcp/
-  conftest.py                   the shared `conn` fixture, and keeping tool calls out of real repositories' memory
-  support.py                    git and file helpers several folders use
-  test_layout.py                file size, docstrings, and this Layout list
-  test_config.py                settings and their refusals
-  test_db.py                    the database check
-  test_registry.py              registering and listing repositories
-  test_samples.py               cloning the sample repositories
-  fixtures/                     parser input files, one folder per language
-  parsing/
-    helpers.py                  the fixtures folder, and a parse's outline, calls, imports and docs
-    test_chunks.py              chunks, line windows, language detection, what a parse returns
-    test_languages.py           the files each language is detected for, and files that must not parse
-    languages/
-      helpers.py                parse a fixture file and read its definitions, docs and calls
-      test_python.py            Python's rules
-      test_go.py                Go's rules
-      test_javascript.py        JavaScript's rules
-      test_csharp.py            C#'s rules
-      test_typescript.py        TypeScript's and TSX's rules
-      test_c_family.py          C's and C++'s rules
-      test_java.py              Java's rules
-      test_kotlin.py            Kotlin's rules
-      test_rust.py              Rust's rules
-      test_php.py               PHP's rules
-      test_ruby.py              Ruby's rules
-      test_swift.py             Swift's rules
-  indexing/
-    conftest.py                 the throwaway repositories the ingest tests ingest
-    helpers.py                  sample files, and readers of what an ingest stored
-    test_files.py               skip reasons, the vendor setting, read-only git
-    test_ingest.py              a full ingest, re-ingesting, failures and refusals
-    test_ingest_incremental.py  an incremental ingest re-reads only what changed
-    test_ingest_extraction.py   graph edges, docs, visibility and namespaces; re-reading old extractions
-    test_ingest_wiki.py         pages marked stale and recompiled by an ingest
-  search/
-    conftest.py                 throwaway repositories and pages, and a repository for feedback
-    helpers.py                  throwaway symbols, a ledger of pages, readers of hits
-    feedback_helpers.py         recording uses, and searching with and without their boost
-    test_model.py               the model and the indexes
-    test_candidates.py          the keyword query
-    test_query.py               refused input, ranking, modes and scope
-    test_query_filters.py       language, limit, snippet and defaults
-    test_ranking.py             where wiki pages are placed among the hits
-    test_ranking_feedback.py    the usage boost in ranking
-    test_feedback.py            uses, weights, listing, adding and resetting
-    test_evaluation.py          retrieval quality, and the gold set
-  graph/
-    conftest.py                 the ingested repositories
-    helpers.py                  two tiny repositories, and readers of the stored edges
-    test_imports.py             import resolution
-    test_build.py               call resolution
-    test_queries.py             callers, calls, impact and definitions
-    test_languages.py           the graph for the languages beyond Python, Go and JavaScript
-  wiki/
-    conftest.py                 a repository with its wiki built, and a fresh one per test
-    helpers.py                  sample repositories, and readers of pages and citations
-    test_compile.py             which directories get a page, what it says, its citations
-    test_compile_languages.py   pages for the other languages, and their test files last
-    test_build.py               building, refusing, marking stale and recompiling
-    test_read.py                pages and read, and their refusals
-  memory/
-    conftest.py                 a connection that needs the model, and a fresh repository
-    helpers.py                  sample runs and repositories, tool calls, readers of runs and facts
-    test_store.py               the package client, the model, what importing memory loads
-    test_runs.py                what a run keeps, and the uses linked to runs
-    test_findings.py            what one run says about its subject
-    test_distill.py             the model's text, its failures, unknown names
-    test_consolidate.py         merging, confidence, contradictions, idempotence, scale
-    test_recheck.py             facts after removed, moved and edited code
-    test_recall.py              recall, facts in search, forgetting
-  server/
-    conftest.py                 pages, recorded runs, and a used repository with a fresh session
-    helpers.py                  calling tools as a client does, the tool contracts, the core results
-    test_app.py                 the listing, refused arguments, outages, logs and recorded runs
-    test_search_tools.py        search_code and get_symbol
-    test_graph_tools.py         find_callers, find_callees and impact_of
-    test_wiki_tools.py          read_wiki
-    test_repository_tools.py    list_repositories
-    test_memory_tools.py        recall and mark_used
-  cli/
-    conftest.py                 the database, the model, and prepared repositories
-    helpers.py                  run ccctx in-process, sample summaries, table readers
-    test_entry.py               ccctx mcp
-    test_output.py              tables and ingest summaries
-    test_index_commands.py      repo, ingest, symbols, stats, model load, db migrate
-    test_search_commands.py     search
-    test_graph_commands.py      callers, calls, impact and eval
-    test_wiki_commands.py       the wiki commands
-    test_memory_commands.py     the memory and feedback commands
-  schema/
-    conftest.py                 a throwaway repository row
-    helpers.py                  the expected tables, and row inserts
-    test_core.py                migrations, repositories, files, symbols, revisions, language columns
-    test_graph.py               the code graph's tables
-    test_wiki.py                the wiki's tables
-    test_memory.py              the memory and feedback tables
-gold.json                       the retrieval evaluation set (`ccctx eval`)
-```
+MIT, see [LICENSE](LICENSE).
